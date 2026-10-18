@@ -1,201 +1,156 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""图表生成模块：把音频渲染成可视化图表（深色报告风格）。
-
-产出两张图：
-  1. 频谱图（Spectrogram）——时频热力图（对数频率轴，magma 配色，-70~0 dB）
-  2. 平均频谱曲线（Welch PSD）——横轴频率（对数）、纵轴功率谱密度（dB/Hz）
-
-设计说明：
-  · 无 GUI 依赖（matplotlib Agg 后端 + Figure API），可在后台线程安全调用；
-  · 音频解码复用 analyzer.decode_pcm（ffmpeg，支持全部常见音频格式）；
-  · 中文字体优先 PingFang SC（macOS 系统字体）。
-"""
-
+"""Phase-safe audio charts with bounded FFT batches and serialized Matplotlib access."""
 import os
+import threading
 import uuid
 
 import numpy as np
-
 import matplotlib
-matplotlib.use("Agg")
+matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-from analyzer import decode_pcm, downmix_mono, probe
+from analyzer import AnalysisCancelled, check_cancel, decode_pcm, probe
 
-# ---- 报告配色（深色主题，与既有报告风格保持一致）----
-BG = "#0f1115"        # 背景
-GRID = "#2a2f3a"      # 网格
-TXT = "#e6e9ef"       # 主文字
-SUB = "#9aa3b2"       # 次级文字
-BLUE = "#5d9cec"      # 主曲线
-DIM = "#8892a6"       # 参考线/标注
-
-matplotlib.rcParams["font.sans-serif"] = [
-    "PingFang SC", "Hiragino Sans GB", "Heiti SC", "Arial Unicode MS", "sans-serif"]
-matplotlib.rcParams["axes.unicode_minus"] = False
-
-# 输出图尺寸（150 dpi：宽 1650 px，适合报告/汇报使用）
-SPEC_FIGSIZE = (11.0, 3.4)
-CURVE_FIGSIZE = (11.0, 3.6)
+BG, GRID, TXT, SUB, BLUE, DIM = '#0f1115', '#2a2f3a', '#e6e9ef', '#9aa3b2', '#5d9cec', '#8892a6'
 DPI = 150
-
-# 图表标题（按界面语言）
-_TITLES = {
-    "zh": {
-        "spec": "频谱图 · {name}（对数频率，相对峰值 dB）",
-        "curve": "平均频谱（Welch PSD） · {name}",
-        "curve_label": "{name}（本曲目）",
-    },
-    "en": {
-        "spec": "Spectrogram · {name} (log frequency, dB re peak)",
-        "curve": "Average Spectrum (Welch PSD) · {name}",
-        "curve_label": "{name}",
-    },
-}
+SPEC_FIGSIZE, CURVE_FIGSIZE = (11, 3.4), (11, 3.6)
+_RENDER_LOCK = threading.Lock()
+matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Hiragino Sans GB', 'Arial Unicode MS', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 
-def _style_ax(ax):
-    ax.set_facecolor(BG)
-    ax.grid(color=GRID, lw=0.4, alpha=0.5)
-    ax.tick_params(colors=SUB, labelsize=8)
-    for sp in ax.spines.values():
-        sp.set_color(GRID)
+def load_audio(path, cancel=None):
+    info = probe(path, cancel=cancel)
+    return decode_pcm(path, info['channels'], cancel=cancel)
 
 
-def load_mono(audio_path):
-    """解码音频为单声道 float32（复用分析引擎的 ffmpeg 解码；带反相相消保护）。"""
-    info = probe(audio_path)
-    pcm, sr = decode_pcm(audio_path, int(info.get("channels") or 0))
-    mono = downmix_mono(pcm)
-    return np.ascontiguousarray(mono, dtype=np.float32), int(sr)
+def _channels(pcm):
+    return pcm[:, None] if pcm.ndim == 1 else pcm
 
 
-def render_spectrogram(mono, sr, out_png, title):
-    """频谱图（时频热力图，对数频率，相对峰值 dB）→ PNG 路径。"""
+def spectrogram_db(pcm, sr, cancel=None):
+    """Root mean channel power, never waveform sum; cap display at about 4000 frames."""
     import librosa
-    import librosa.display
+    data = _channels(pcm)
+    if len(data) < 2:
+        raise ValueError('音频过短，无法计算频谱图')
+    n_fft = min(2048, len(data))
+    hop = max(512, int(np.ceil(len(data) / 4000)))
+    power = None
+    for ch in range(data.shape[1]):
+        check_cancel(cancel)
+        x = librosa.stft(data[:, ch], n_fft=n_fft, hop_length=hop)
+        p = np.abs(x) ** 2
+        power = p if power is None else power + p
+    power /= data.shape[1]
+    if not np.isfinite(power).all():
+        raise ValueError('音频含无效样本')
+    peak = float(power.max())
+    if peak <= 1e-20:
+        db = np.full(power.shape, -70.0)
+    else:
+        db = 10 * np.log10(np.maximum(power / peak, 1e-7))
+    return db, hop, n_fft
 
-    S = librosa.stft(mono, n_fft=2048, hop_length=512)
-    db = librosa.amplitude_to_db(np.abs(S), ref=np.max)
 
-    fig = Figure(figsize=SPEC_FIGSIZE, dpi=DPI)
+def average_psd(pcm, sr, cancel=None):
+    """Welch PSD averaged over channel powers, using bounded batches of complete windows."""
+    from scipy import signal
+    data = _channels(pcm)
+    n = len(data)
+    if n < 2:
+        raise ValueError('音频过短，无法计算平均频谱')
+    nperseg = min(8192, n)
+    overlap = nperseg // 2
+    hop = nperseg - overlap
+    batch = max(1, 128 // data.shape[1])
+    total, count = None, 0
+    for start in range(0, n - nperseg + 1, batch * hop):
+        check_cancel(cancel)
+        part = data[start:min(n, start + nperseg + (batch - 1) * hop)]
+        windows = (len(part) - nperseg) // hop + 1
+        f, p = signal.welch(part, sr, nperseg=nperseg, noverlap=overlap, axis=0)
+        p = p.mean(axis=1)
+        total = p * windows if total is None else total + p * windows
+        count += windows
+    return f, total / count
+
+
+def _figure(size):
+    fig = Figure(figsize=size, dpi=DPI)
     FigureCanvasAgg(fig)
     fig.patch.set_facecolor(BG)
     ax = fig.add_subplot(111)
-    img = librosa.display.specshow(db, sr=sr, hop_length=512,
-                                   x_axis="time", y_axis="log", ax=ax,
-                                   cmap="magma", vmin=-70, vmax=0)
-    ax.set_xlabel("时间 (s)", color=SUB, fontsize=9)
-    ax.set_ylabel("频率 (Hz)", color=SUB, fontsize=9)
-    ax.set_title(title, color=TXT, fontsize=11)
+    ax.set_facecolor(BG)
     ax.tick_params(colors=SUB, labelsize=8)
-    cb = fig.colorbar(img, ax=ax, format="%+2.0f dB")
+    for spine in ax.spines.values():
+        spine.set_color(GRID)
+    return fig, ax
+
+
+def render_spectrogram(pcm, sr, out_png, title, *, lang='zh', cancel=None):
+    import librosa.display
+    db, hop, n_fft = spectrogram_db(pcm, sr, cancel)
+    fig, ax = _figure(SPEC_FIGSIZE)
+    img = librosa.display.specshow(db, sr=sr, hop_length=hop, n_fft=n_fft,
+                                  x_axis='time', y_axis='log', ax=ax,
+                                  cmap='magma', vmin=-70, vmax=0)
+    ax.set_xlabel('时间 (s)' if lang == 'zh' else 'Time (s)', color=SUB, fontsize=9)
+    ax.set_ylabel('频率 (Hz)' if lang == 'zh' else 'Frequency (Hz)', color=SUB, fontsize=9)
+    ax.set_title(title, color=TXT, fontsize=11)
+    cb = fig.colorbar(img, ax=ax, format='%+2.0f dB')
     cb.ax.tick_params(colors=SUB, labelsize=8)
     cb.outline.set_edgecolor(GRID)
     fig.tight_layout()
+    check_cancel(cancel)
     fig.savefig(out_png, facecolor=BG)
+    fig.clear()
     return out_png
 
 
-def render_spectrum_curve(mono, sr, out_png, title, curve_label):
-    """平均频谱曲线（Welch PSD）→ PNG 路径。
-
-    分段/重叠长度随实际样本数自适应（支持 50ms 级短音频；极短 <2 样本时抛错）。
-    """
-    from scipy import signal as scisig
-
-    n = int(mono.size)
-    if n < 2:
-        raise ValueError("音频过短，无法计算平均频谱")
-    nperseg = max(2, min(8192, n))
-    noverlap = nperseg // 2
-    f, p = scisig.welch(mono, sr, nperseg=nperseg, noverlap=noverlap)
-
-    fig = Figure(figsize=CURVE_FIGSIZE, dpi=DPI)
-    FigureCanvasAgg(fig)
-    fig.patch.set_facecolor(BG)
-    ax = fig.add_subplot(111)
-    ax.semilogx(f, 10 * np.log10(p + 1e-12), color=BLUE, lw=1.3,
-                label=curve_label)
-    ax.axvline(1000, color=DIM, lw=0.7, ls=":", alpha=0.7)
-    ax.axvline(5000, color=DIM, lw=0.7, ls=":", alpha=0.7)
-    y0 = ax.get_ylim()[0]
-    ax.text(1050, y0 + 2, "1 kHz", color=SUB, fontsize=8)
-    ax.text(5200, y0 + 2, "5 kHz", color=SUB, fontsize=8)
-    ax.set_xlim(20, 20000)
-    ax.set_xlabel("频率 (Hz, 对数)", color=SUB, fontsize=9)
-    ax.set_ylabel("功率谱密度 (dB/Hz)", color=SUB, fontsize=9)
+def render_spectrum_curve(pcm, sr, out_png, title, curve_label, *, lang='zh', cancel=None):
+    f, p = average_psd(pcm, sr, cancel)
+    fig, ax = _figure(CURVE_FIGSIZE)
+    ax.semilogx(f[1:], 10 * np.log10(p[1:] + 1e-20), color=BLUE, lw=1.3, label=curve_label)
+    ax.set_xlim(20, max(21, min(20000, sr / 2)))
+    ax.set_xlabel('频率 (Hz, 对数)' if lang == 'zh' else 'Frequency (Hz, log)', color=SUB, fontsize=9)
+    ax.set_ylabel('功率谱密度 (dB/Hz)' if lang == 'zh' else 'Power spectral density (dB/Hz)', color=SUB, fontsize=9)
     ax.set_title(title, color=TXT, fontsize=11)
-    ax.legend(loc="upper right", fontsize=9, framealpha=0.15)
-    _style_ax(ax)
+    ax.grid(color=GRID, lw=0.4, alpha=0.5)
+    ax.legend(loc='upper right', fontsize=9, framealpha=0.15)
     fig.tight_layout()
+    check_cancel(cancel)
     fig.savefig(out_png, facecolor=BG)
+    fig.clear()
     return out_png
 
 
-def _safe_stem(name):
-    stem = os.path.splitext(os.path.basename(name))[0]
-    cleaned = "".join(ch if ch not in '/\\:*?"<>|' else "_" for ch in stem).strip()
-    return cleaned or "audio"
-
-
-def generate_charts(audio_path, out_dir, display_name, on_chart=None, lang="zh"):
-    """生成两张图表。
-
-    audio_path:   音频文件路径
-    out_dir:      输出目录（自动创建）
-    display_name: 图标题中显示的名称（如 "爱已成空1.mp3"）
-    on_chart:     可选回调 on_chart(kind, png_path)——每张图完成时调用一次，
-                  kind ∈ {"spectrogram", "spectrum"}（供 UI 流式展示）
-    lang:         图表标题语言（"zh" / "en"）
-
-    返回 {"spectrogram": png1, "spectrum": png2}
-    """
-    try:
-        return _generate_impl(audio_path, out_dir, display_name, on_chart, lang)
-    except Exception as e:  # noqa: BLE001
-        # 缓存损坏类错误 → 清理 JIT 缓存后重试一次（自愈）
-        from analyzer import clear_numba_cache, is_likely_cache_error
-        if is_likely_cache_error(e):
-            clear_numba_cache()
-            return _generate_impl(audio_path, out_dir, display_name, on_chart, lang)
-        raise
-
-
-def _generate_impl(audio_path, out_dir, display_name, on_chart=None, lang="zh"):
+def generate_charts(audio_path, out_dir, display_name, on_chart=None, lang='zh', cancel=None):
     os.makedirs(out_dir, exist_ok=True)
-    t = _TITLES.get(lang, _TITLES["zh"])
-    title_name = os.path.splitext(os.path.basename(display_name))[0] or display_name
-    tag = f"{_safe_stem(audio_path)}_{uuid.uuid4().hex[:8]}"
-
-    mono, sr = load_mono(audio_path)
-
-    p_spec = os.path.join(out_dir, f"{tag}_spectrogram.png")
-    render_spectrogram(mono, sr, p_spec, t["spec"].format(name=title_name))
-    if on_chart:
-        on_chart("spectrogram", p_spec)
-
-    p_curve = os.path.join(out_dir, f"{tag}_spectrum.png")
-    render_spectrum_curve(mono, sr, p_curve,
-                          t["curve"].format(name=title_name),
-                          t["curve_label"].format(name=title_name))
-    if on_chart:
-        on_chart("spectrum", p_curve)
-
-    return {"spectrogram": p_spec, "spectrum": p_curve}
-
-
-if __name__ == "__main__":
-    # 命令行自测：python charts.py <音频文件> [输出目录]
-    import sys
-
-    if len(sys.argv) < 2:
-        print("用法: python charts.py <音频文件> [输出目录]")
-        sys.exit(1)
-    out = sys.argv[2] if len(sys.argv) > 2 else "/tmp/charts_demo"
-    paths = generate_charts(
-        sys.argv[1], out, os.path.basename(sys.argv[1]),
-        on_chart=lambda k, p: print(f"  {k}: {p}"))
-    print("完成，共", len(paths), "张图")
+    pcm, sr = load_audio(audio_path, cancel)
+    name = os.path.splitext(os.path.basename(display_name))[0]
+    tag = uuid.uuid4().hex
+    paths = {kind: os.path.join(out_dir, f'{tag}_{kind}.png')
+             for kind in ('spectrogram', 'spectrum')}
+    while not _RENDER_LOCK.acquire(timeout=0.1):
+        check_cancel(cancel)
+    try:
+        check_cancel(cancel)
+        title = f'频谱图 · {name}（各声道功率汇总，相对峰值 dB）' if lang == 'zh' else f'Spectrogram · {name} (channel power, dB re peak)'
+        render_spectrogram(pcm, sr, paths['spectrogram'], title, lang=lang, cancel=cancel)
+        if on_chart:
+            on_chart('spectrogram', paths['spectrogram'])
+        title = f'平均频谱（Welch PSD） · {name}' if lang == 'zh' else f'Average spectrum (Welch PSD) · {name}'
+        render_spectrum_curve(pcm, sr, paths['spectrum'], title, name, lang=lang, cancel=cancel)
+        if on_chart:
+            on_chart('spectrum', paths['spectrum'])
+    except BaseException:
+        for path in paths.values():
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        raise
+    finally:
+        _RENDER_LOCK.release()
+    return paths
