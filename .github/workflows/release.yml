@@ -47,7 +47,7 @@ jobs:
           path: dist/**/*.dmg*
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
     needs: verify
     runs-on: ubuntu-latest
     permissions:
@@ -63,9 +63,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(python3 -c 'from version import APP_VERSION; print(APP_VERSION)')
-          test "${GITHUB_REF_NAME}" = "v${version}"
+          tag="v${version}"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            test "${GITHUB_REF_NAME}" = "${tag}"
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; preserving the published files."
+            exit 0
+          fi
           mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.sha256' \))
           test "${#assets[@]}" -eq 2
-          gh release create "${GITHUB_REF_NAME}" --verify-tag --latest \
+          gh release create "${tag}" --target "${GITHUB_SHA}" --latest \
             --title "v${version} 音频分析（macOS · Apple Silicon）" \
             --notes-file RELEASE_NOTES.md "${assets[@]}"
