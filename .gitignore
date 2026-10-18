@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+build/
+dist/
+*.spec
+
+.venv/
+venv/
+
+# 自测脚本生成的测试音频
+test_*.wav
