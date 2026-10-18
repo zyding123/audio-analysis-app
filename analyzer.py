@@ -11,7 +11,7 @@
   5. 真峰值    True Peak，单位 dBTP（用于发现采样点间削波）
   6. 速度      BPM（节拍自动估计）
 
-依赖：ffmpeg / ffprobe（参考级 EBU R128 实现 libebur128 的封装）、numpy、librosa。
+依赖：FFmpeg / ffprobe、numpy、librosa。
 """
 
 import os
@@ -19,6 +19,9 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+
+from version import APP_VERSION
 from dataclasses import dataclass, field, asdict
 
 import numpy as np
@@ -27,8 +30,7 @@ import numpy as np
 FULLSCALE_THRESHOLD = 0.999
 # 削波区间合并的最大间隔（秒）：小于该间隔的离散削波点合并为一段
 CLIP_MERGE_GAP_S = 0.25
-# 判定“真削波”的最小连续样本数：真实削波会形成平顶（连续多个满幅样本）；
-# 孤立 1~2 个样本越过阈值多为“接近满幅的正常峰值”，不算削波
+# 满幅平台候选的最小长度；同时要求同极性和平坦度，结果不等同于听感失真。
 MIN_CLIP_RUN = 3
 
 
@@ -44,6 +46,20 @@ class ClipRange:
     channel: int = 0      # 声道索引（从 1 开始）
 
 
+def file_signature(path):
+    """Nanosecond timestamp and byte count identify the measured source revision."""
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+METRIC_FIELDS = ("integrated_lufs", "loudness_range_lu", "true_peak_dbtp",
+                 "sample_peak_dbfs", "centroid_magnitude_hz", "centroid_power_hz",
+                 "bpm", "clip_percent")
+
+
 @dataclass
 class AnalysisResult:
     path: str = ""
@@ -51,84 +67,104 @@ class AnalysisResult:
     sample_rate: int = 0
     channels: int = 0
     duration: float = 0.0
-
-    integrated_lufs: float = 0.0     # 积分响度（LUFS）
-    loudness_range_lu: float = 0.0   # LRA（LU）
-    true_peak_dbtp: float = 0.0      # 真峰值（dBTP）
-    sample_peak_dbfs: float = 0.0    # 样本峰值（dBFS，0.0 = 满幅）
-    centroid_magnitude_hz: float = 0.0  # 频谱质心·幅度加权（Hz；行业标准口径）
-    centroid_power_hz: float = 0.0      # 频谱质心·功率加权（Hz；旧版口径）
-    bpm: float = 0.0                 # 速度（BPM；0 = 未测出/不适用）
-
-    clipped: bool = False            # 是否存在满幅削波
+    integrated_lufs: float | None = None
+    loudness_range_lu: float | None = None
+    true_peak_dbtp: float | None = None
+    sample_peak_dbfs: float | None = None
+    centroid_magnitude_hz: float | None = None
+    centroid_power_hz: float | None = None
+    bpm: float | None = None
+    clipped: bool | None = None
     clipped_samples: int = 0
     total_samples: int = 0
-    clip_percent: float = 0.0        # 削波样本占比（0~1）
+    clip_percent: float | None = None
     clip_ranges: list = field(default_factory=list)
-
     error: str = ""
+    warnings: list = field(default_factory=list)
+    source_mtime_ns: int | None = None
+    source_size: int | None = None
+    analysis_version: str = APP_VERSION
 
-    # ---- 便捷属性 ----
     @property
-    def clip_percent_display(self) -> float:
-        return round(self.clip_percent * 100, 4)
+    def is_stale(self):
+        if self.source_mtime_ns is None or self.source_size is None:
+            return False  # Legacy records remain readable, with a provenance warning.
+        return file_signature(self.path) != (self.source_mtime_ns, self.source_size)
 
     @property
-    def true_peak_ok(self) -> bool:
-        """真峰值是否超过 0 dBTP（存在采样点间削波风险）。"""
-        return self.true_peak_dbtp <= 0.0
+    def clip_percent_display(self):
+        return None if self.clip_percent is None else round(self.clip_percent * 100, 4)
 
-    def to_dict(self) -> dict:
+    @property
+    def true_peak_ok(self):
+        return None if self.true_peak_dbtp is None else self.true_peak_dbtp <= 0.0
+
+    def to_dict(self, *, for_export=True):
         d = asdict(self)
-        d["clip_ranges"] = [
-            {"start": round(r.start, 3), "end": round(r.end, 3),
-             "channel": r.channel} for r in self.clip_ranges
-        ]
-        d["bpm"] = round(self.bpm, 1)
+        d["clip_ranges"] = [dict(start=round(r.start, 6), end=round(r.end, 6),
+                                 channel=r.channel) for r in self.clip_ranges]
+        d["bpm"] = round(self.bpm, 1) if self.bpm is not None else None
         d["clip_percent_display"] = self.clip_percent_display
         d["true_peak_ok"] = self.true_peak_ok
-        # 对外导出保持标准 JSON：无穷值用 null 表示（严格解析器不接受 -Infinity）
-        for key in ("true_peak_dbtp", "sample_peak_dbfs", "integrated_lufs",
-                    "loudness_range_lu"):
-            if isinstance(d.get(key), float) and not np.isfinite(d[key]):
+        d["source_changed"] = self.is_stale
+        for key in METRIC_FIELDS:
+            if d[key] is not None and not np.isfinite(d[key]):
                 d[key] = None
+        if for_export and self.is_stale:
+            for key in METRIC_FIELDS:
+                d[key] = None
+            d.update(clipped=None, clip_ranges=[], clipped_samples=None,
+                     clip_percent_display=None, true_peak_ok=None)
+            d["error"] = (self.error + "；" if self.error else "") + "源文件已更新或不存在，请重新分析"
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "AnalysisResult":
-        """从 to_dict 的输出重建（用于持久化恢复）。"""
+    def from_dict(cls, d):
+        values = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        values["clip_ranges"] = [ClipRange(start=r.get("start", 0), end=r.get("end", 0),
+                                           channel=r.get("channel", 1))
+                                 for r in d.get("clip_ranges", [])]
+        for key in METRIC_FIELDS:
+            v = values.get(key)
+            values[key] = v if isinstance(v, (int, float)) and np.isfinite(v) else None
+        if "analysis_version" not in d:
+            values["analysis_version"] = "legacy"
+            values["warnings"] = list(d.get("warnings", [])) + ["旧版记录缺少源文件版本信息，建议重新分析"]
+            if d.get("error"):
+                for key in METRIC_FIELDS:
+                    if values.get(key) == 0:
+                        values[key] = None
+                if not d.get("clipped"):
+                    values["clipped"] = None
+        return cls(**values)
 
-        def _fin(v, default=0.0):
-            """None → -inf 还原（to_dict 会把无穷写成 null）。"""
-            if v is None:
-                return float("-inf")
-            return v if isinstance(v, (int, float)) else default
 
-        res = cls(
-            path=d.get("path", ""),
-            filename=d.get("filename", ""),
-            sample_rate=d.get("sample_rate", 0),
-            channels=d.get("channels", 0),
-            duration=d.get("duration", 0.0),
-            integrated_lufs=_fin(d.get("integrated_lufs")),
-            loudness_range_lu=_fin(d.get("loudness_range_lu")),
-            true_peak_dbtp=_fin(d.get("true_peak_dbtp")),
-            sample_peak_dbfs=_fin(d.get("sample_peak_dbfs")),
-            centroid_magnitude_hz=d.get("centroid_magnitude_hz", 0.0),
-            centroid_power_hz=d.get("centroid_power_hz", 0.0),
-            bpm=d.get("bpm", 0.0),
-            clipped=d.get("clipped", False),
-            clipped_samples=d.get("clipped_samples", 0),
-            total_samples=d.get("total_samples", 0),
-            clip_percent=d.get("clip_percent", 0.0),
-            error=d.get("error", ""),
-        )
-        res.clip_ranges = [
-            ClipRange(start=r.get("start", 0.0), end=r.get("end", 0.0),
-                      channel=r.get("channel", 1))
-            for r in d.get("clip_ranges", [])
-        ]
-        return res
+def check_cancel(cancel):
+    if cancel is not None and cancel():
+        raise AnalysisCancelled()
+
+
+def run_process(cmd, *, cancel=None, stdout=subprocess.PIPE, text=False):
+    """Poll a child process so Stop can terminate ffprobe/ffmpeg mid-file."""
+    check_cancel(cancel)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stdout,
+                            stderr=subprocess.PIPE, text=text)
+    try:
+        while True:
+            check_cancel(cancel)
+            try:
+                out, err = proc.communicate(timeout=0.1)
+                return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+            except subprocess.TimeoutExpired:
+                pass
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -191,7 +227,7 @@ def ensure_ffmpeg():
 # 基础信息
 # --------------------------------------------------------------------------- #
 
-def probe(path: str) -> dict:
+def probe(path: str, cancel=None) -> dict:
     """读取采样率、声道数、时长。"""
     ffmpeg, ffprobe = ensure_ffmpeg()
     if not ffprobe:
@@ -204,7 +240,7 @@ def probe(path: str) -> dict:
         "-show_entries", "format=duration",
         "-of", "json", path,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_process(cmd, cancel=cancel, text=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "无法读取音频流")
 
@@ -229,7 +265,7 @@ def probe(path: str) -> dict:
 # 响度测量（EBU R128）
 # --------------------------------------------------------------------------- #
 
-def measure_loudness(path: str):
+def measure_loudness(path: str, cancel=None):
     """
     通过 ffmpeg ebur128 过滤器测量积分响度 / LRA / 真峰值。
     返回 (integrated_lufs, lra_lu, true_peak_dbtp)。
@@ -246,8 +282,11 @@ def measure_loudness(path: str):
         "-af", "ebur128=peak=true:framelog=none",
         "-f", "null", "-",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = run_process(cmd, cancel=cancel, text=True)
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+
+    if proc.returncode != 0:
+        raise RuntimeError("响度测量失败：" + (proc.stderr or "ffmpeg 解码失败")[-2000:])
 
     # 只解析最终 Summary 段（逐帧日志可能含初始值，需规避）
     idx = combined.rfind("Summary:")
@@ -260,13 +299,13 @@ def measure_loudness(path: str):
     # 真峰值：peak=true 时 Summary 中仅此一个 "Peak:"，单位随版本可能为 dBFS 或 dBTP
     true_peak = _search_float(section, r"Peak:\s*" + _num + r"\s*dB")
 
-    if integrated is None and lra is None:
+    if integrated is None or lra is None or true_peak is None:
         raise RuntimeError("响度测量失败：" + (combined.strip() or "未知错误"))
 
     return (
-        integrated if integrated is not None else 0.0,
-        lra if lra is not None else 0.0,
-        true_peak if true_peak is not None else 0.0,
+        integrated if integrated > -70 and np.isfinite(integrated) else None,
+        lra if np.isfinite(lra) else None,
+        true_peak if np.isfinite(true_peak) else None,
     )
 
 
@@ -280,206 +319,124 @@ def _search_float(text: str, pattern: str):
     return None
 
 
-def downmix_mono(pcm: np.ndarray) -> np.ndarray:
-    """立体声 → 单声道（带反相相消保护）。
+def downmix_mono(pcm):
+    """Conventional mono downmix for callers that explicitly want mono.
 
-    常规情况取 (L+R)/2；当左右声道明显反相（差信号能量显著大于和信号，
-    相关系数约 < -0.23）时改取 (L-R)/2——避免频谱质心 / BPM / 频谱图表把
-    “有声音的反相立体声”测成静音（相互抵消），也覆盖带相位处理的素材。
+    Analysis uses separate channel spectra/onsets, never this lossy waveform sum.
     """
-    if pcm.ndim < 2 or pcm.shape[1] < 2:
-        return pcm if pcm.ndim == 1 else pcm[:, 0]
-    m_sum = pcm.mean(axis=1)
-    m_diff = (pcm[:, 0].astype(np.float64) - pcm[:, 1].astype(np.float64)) / 2.0
-    e_sum = float(np.dot(m_sum, m_sum))
-    e_diff = float(np.dot(m_diff, m_diff))
-    if e_diff > e_sum * 1.3:
-        return m_diff.astype(m_sum.dtype, copy=False)
-    return m_sum
+    return pcm.mean(axis=1) if pcm.ndim > 1 else pcm
 
 
-# --------------------------------------------------------------------------- #
-# PCM 解码
-# --------------------------------------------------------------------------- #
-
-def decode_pcm(path: str, channels: int):
-    """
-    解码为 float32 PCM，返回 (pcm[n_samples, n_channels], sample_rate)。
-    采样率从 ffprobe 获取（与 probe 一致）。
-    """
+def decode_pcm(path, channels, cancel=None):
+    """Decode to an anonymous temporary file and map it, instead of holding bytes in RAM."""
     ffmpeg, _ = ensure_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError("未找到 ffmpeg")
-
-    info = probe(path)
-    sr = info["sample_rate"]
-
-    cmd = [
-        ffmpeg, "-v", "error",
-        "-i", path,
-        "-map", "a:0",
-        "-f", "f32le",
-        "-c:a", "pcm_f32le",
-        "-",
-    ]
-    proc = subprocess.run(cmd, capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode(errors="ignore").strip() or "解码失败")
-
-    raw = proc.stdout
-    if not raw:
-        return np.zeros((0, channels), dtype=np.float32), sr
-
-    n_ch = channels if channels > 0 else 1
-    arr = np.frombuffer(raw, dtype="<f4")
-    if n_ch > 1:
-        arr = arr.reshape(-1, n_ch)
-    else:
-        arr = arr.reshape(-1, 1)
-    return arr, sr
+    info = probe(path, cancel=cancel)
+    n_ch = channels if channels > 0 else info["channels"]
+    with tempfile.TemporaryFile() as raw:
+        cmd = [ffmpeg, "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0",
+               "-vn", "-f", "f32le", "-c:a", "pcm_f32le", "-"]
+        proc = run_process(cmd, cancel=cancel, stdout=raw)
+        if proc.returncode:
+            raise RuntimeError(proc.stderr.decode(errors="replace")[-2000:] or "解码失败")
+        size = raw.tell()
+        if not size:
+            raise RuntimeError("音频流没有可解码的样本")
+        if n_ch <= 0 or size % (4 * n_ch):
+            raise RuntimeError("解码数据与声道数不匹配")
+        pcm = np.memmap(raw, dtype="<f4", mode="r", shape=(size // (4 * n_ch), n_ch))
+    return pcm, info["sample_rate"]
 
 
-# --------------------------------------------------------------------------- #
-# 削波检测
-# --------------------------------------------------------------------------- #
+def iter_pcm_blocks(pcm, cancel=None, block=65536):
+    for start in range(0, len(pcm), block):
+        check_cancel(cancel)
+        part = pcm[start:start + block]
+        if not np.isfinite(part).all():
+            raise ValueError("音频含 NaN/Infinity 无效样本")
+        yield start, part
 
-def detect_clipping(pcm: np.ndarray, sample_rate: int):
+
+def sample_peak(pcm, cancel=None):
+    peak = 0.0
+    for _, part in iter_pcm_blocks(pcm, cancel):
+        peak = max(peak, float(np.max(np.abs(part))))
+    return 20 * np.log10(peak) if peak > 0 else None
+
+
+def detect_clipping(pcm, sample_rate, cancel=None):
+    """Conservative full-scale plateau/over-range candidates, with block-boundary continuity.
+
+    Three samples merely near 1.0 are not sufficient: same-polarity samples must
+    also form a flat plateau. This heuristic does not establish audible distortion.
     """
-    返回 (clipped_samples, total_samples, clip_ranges)。
-    pcm 形状 (n_samples, n_channels)。
-    """
-    total = int(pcm.size)
-    mask = np.abs(pcm) >= FULLSCALE_THRESHOLD
-
-    if pcm.ndim == 1:
-        mask = mask[:, None]
-
-    ranges = []
-    clipped_samples = 0
-    if mask.any():
-        gap = max(int(sample_rate * CLIP_MERGE_GAP_S), 1)
-        n_ch = mask.shape[1]
-        for ch in range(n_ch):
-            col = mask[:, ch]
-            idx = np.flatnonzero(col)
-            if idx.size < MIN_CLIP_RUN:
-                continue
-            # ① 严格连续段：相邻样本严格差 1 才算「连续满幅」
-            strict_splits = np.flatnonzero(np.diff(idx) > 1) + 1
-            strict_runs = np.split(idx, strict_splits)
-            # ② 过滤孤立峰值：连续点数 < MIN_CLIP_RUN 视为「接近满幅的正常峰值」
-            #    （真实削波会形成平顶；孤立 1~2 点越过阈值不算削波）
-            solid = [r for r in strict_runs if len(r) >= MIN_CLIP_RUN]
-            if not solid:
-                continue
-            solid_idx = np.concatenate(solid)
-            clipped_samples += int(solid_idx.size)
-            # ③ 报告层合并：间隔 < gap 的削波段合并为一段（便于阅读）
-            merge_splits = np.flatnonzero(np.diff(solid_idx) > gap) + 1
-            for run in np.split(solid_idx, merge_splits):
-                s, e = int(run[0]), int(run[-1])
-                ranges.append(ClipRange(
-                    start=float(s) / sample_rate,
-                    end=float(e) / sample_rate,
-                    channel=ch + 1,
-                ))
-
+    data = pcm[:, None] if pcm.ndim == 1 else pcm
+    total = int(data.size)
+    gap = max(int(sample_rate * CLIP_MERGE_GAP_S), 1)
+    ranges, clipped_samples = [], 0
+    for ch in range(data.shape[1]):
+        pending = None
+        merged = []
+        def emit(run):
+            nonlocal clipped_samples
+            if run is None:
+                return
+            start, end, _, over = run
+            if end - start + 1 < MIN_CLIP_RUN and not over:
+                return
+            clipped_samples += end - start + 1
+            if merged and start - merged[-1][1] <= gap:
+                merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        for offset, part in iter_pcm_blocks(data, cancel):
+            x = np.asarray(part[:, ch])
+            high = np.abs(x) >= FULLSCALE_THRESHOLD
+            link = (high[1:] & high[:-1] & (np.signbit(x[1:]) == np.signbit(x[:-1]))
+                    & (np.abs(np.diff(x)) <= 1e-7))
+            starts = np.flatnonzero(high & np.r_[True, ~link])
+            ends = np.flatnonzero(high & np.r_[~link, True])
+            for st, en in zip(starts, ends):
+                run = (offset + int(st), offset + int(en), float(x[en]),
+                       bool(np.any(np.abs(x[st:en + 1]) > 1)))
+                if (pending is not None and run[0] == pending[1] + 1
+                        and np.signbit(x[st]) == np.signbit(pending[2])
+                        and abs(float(x[st]) - pending[2]) <= 1e-7):
+                    pending = (pending[0], run[1], run[2], pending[3] or run[3])
+                else:
+                    emit(pending)
+                    pending = run
+            if pending is not None and pending[1] < offset + len(x) - 1:
+                emit(pending)
+                pending = None
+        emit(pending)
+        ranges.extend(ClipRange(start=s / sample_rate, end=(e + 1) / sample_rate,
+                                channel=ch + 1) for s, e in merged)
     return clipped_samples, total, ranges
 
 
-# --------------------------------------------------------------------------- #
-# 频谱质心（双口径）
-# --------------------------------------------------------------------------- #
-
-def spectral_centroids(pcm_mono: np.ndarray, sample_rate: int,
-                       frame: int = 2048, hop: int = 512):
-    """
-    频谱质心（频率对频谱的"重心"），同时给出两种加权口径，单位 Hz：
-
-      · 幅度加权（行业标准口径，教科书 / librosa / Essentia 定义）：
-            centroid = Σ(f · |X(f)|) / Σ|X(f)|
-      · 功率加权（旧版工具口径）：
-            centroid = Σ(f · |X(f)|²) / Σ|X(f)|²
-
-    整体统计取"逐帧质心的时间算术平均"——与 librosa（sequential frame
-    centroids + np.mean）的标准用法一致，保证跨工具数值可比。
-
-    返回 (magnitude_weighted_hz, power_weighted_hz)；无法计算时返回 (0.0, 0.0)。
-    """
-    n = len(pcm_mono)
-    if n < frame or sample_rate <= 0:
-        return 0.0, 0.0
-
-    window = np.hanning(frame)
-    freqs = np.fft.rfftfreq(frame, 1.0 / sample_rate)
-
-    cents_mag = []
-    cents_pow = []
-    for start in range(0, n - frame + 1, hop):
-        seg = pcm_mono[start:start + frame] * window
-        mag = np.abs(np.fft.rfft(seg))
-
-        w_m = float(mag.sum())
-        if w_m > 1e-12:
-            cents_mag.append(float(np.sum(freqs * mag)) / w_m)
-
-        pw = mag * mag
-        w_p = float(pw.sum())
-        if w_p > 1e-12:
-            cents_pow.append(float(np.sum(freqs * pw)) / w_p)
-
-    mag_hz = float(np.mean(cents_mag)) if cents_mag else 0.0
-    pow_hz = float(np.mean(cents_pow)) if cents_pow else 0.0
-    return mag_hz, pow_hz
-
-
-# --------------------------------------------------------------------------- #
-# JIT 缓存自愈（防御性工具）
-# --------------------------------------------------------------------------- #
-
-_CACHE_ERROR_MARKERS = (
-    "decompress", "incorrect header", "zlib", "cache",
-    "corrupt", "unpickling", "invalid load key", "bad magic",
-)
-
-
-def is_likely_cache_error(exc: BaseException) -> bool:
-    """判断异常是否疑似"JIT / 缓存损坏"类错误（用于触发清理重试）。"""
-    try:
-        msg = str(exc).lower()
-    except Exception:  # noqa: BLE001
-        return False
-    return any(m in msg for m in _CACHE_ERROR_MARKERS)
-
-
-def clear_numba_cache() -> bool:
-    """清理 numba 用户级 JIT 缓存（用于"缓存损坏"类错误的自愈）。
-
-    返回 True 表示执行了清理；任何失败静默忽略（不影响分析主流程）。
-    会在 ~/Library/Logs/AudioAnalysis-cache-heal.log 留痕，便于排障。
-    """
-    cache_dir = ""
-    try:
-        try:
-            from numba.misc.appdirs import AppDirs
-            cache_dir = AppDirs(appname="numba", appauthor=False).user_cache_dir
-        except Exception:  # noqa: BLE001
-            cache_dir = os.path.expanduser("~/Library/Caches/numba")
-        if cache_dir and os.path.isdir(cache_dir):
-            import shutil
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            try:
-                import time as _t
-                with open(os.path.expanduser(
-                        "~/Library/Logs/AudioAnalysis-cache-heal.log"), "a") as f:
-                    f.write(f"[{_t.strftime('%Y-%m-%d %H:%M:%S')}] "
-                            f"cleared numba cache: {cache_dir}\n")
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-    except Exception:  # noqa: BLE001
-        pass
-    return False
+def spectral_centroids(pcm, sample_rate, frame=2048, hop=512, cancel=None):
+    """Average frame centroids from summed channel magnitudes/powers (phase-safe)."""
+    data = pcm[:, None] if pcm.ndim == 1 else pcm
+    if len(data) < 2 or sample_rate <= 0:
+        return None, None
+    frame = min(frame, len(data))
+    window = np.hanning(frame)[:, None]
+    freqs = np.fft.rfftfreq(frame, 1 / sample_rate)
+    sums = np.zeros(2)
+    counts = np.zeros(2, dtype=int)
+    for i, start in enumerate(range(0, len(data) - frame + 1, hop)):
+        if i % 128 == 0:
+            check_cancel(cancel)
+        seg = data[start:start + frame]
+        if not np.isfinite(seg).all():
+            raise ValueError("音频含无效样本")
+        mag = np.abs(np.fft.rfft(seg * window, axis=0))
+        for k, weights in enumerate((mag.sum(axis=1), (mag * mag).sum(axis=1))):
+            mass = float(weights.sum())
+            if mass > 1e-12:
+                sums[k] += float(np.dot(freqs, weights)) / mass
+                counts[k] += 1
+    return tuple(float(sums[k] / counts[k]) if counts[k] else None for k in range(2))
 
 
 # --------------------------------------------------------------------------- #
@@ -491,149 +448,103 @@ BPM_HOP_LENGTH = 256    # 帧移；22050/256 ≈ 86 帧/秒，兼顾 BPM 分辨�
 BPM_MAX_ANALYZE_S = 120  # 长音频只取中间该秒数（避免长前奏/尾奏干扰并提速）
 
 
-def estimate_bpm(pcm_mono: np.ndarray, sample_rate: int) -> float:
-    """
-    自动估计速度（BPM，beats per minute）。
-
-    方法：librosa 的 tempogram 节拍估计（onset 强度包络 → 自相关 → 对数正态
-    先验聚合，取时间中位数）。为保证不同来源文件可比，统一重采样到 22050 Hz、
-    帧移 256；超过 3 分钟的音频只取中间 120 秒分析。
-
-    注意：自动节拍估计对 2 倍/半速（及 1.5 倍三连音）存在天然歧义，
-    边界处可能相差一个倍频；返回值保留一位小数供人工复核。
-
-    返回：BPM（float）。不可用/失败/近似静音时返回 0.0。
-    """
-
-    def _compute() -> float:
-        import librosa
-        from librosa.feature.rhythm import tempo as _tempo
-
-        y = pcm_mono
-        if y.ndim > 1:
-            y = y.mean(axis=1)
-        y = np.ascontiguousarray(y, dtype=np.float32)
-
-        sr = int(sample_rate) if sample_rate else BPM_TARGET_SR
-        if y.size < sr * 2:  # 少于 2 秒，无法可靠估计
-            return 0.0
-        if float(np.abs(y).max()) < 1e-4:  # 近似静音
-            return 0.0
-
-        # 长音频取中间 120 秒（在重采样前裁剪，按原采样率换算）
-        if y.size > sr * 180:
-            center = y.size // 2
-            half = int(sr * (BPM_MAX_ANALYZE_S / 2))
-            y = y[center - half: center + half]
-
+def estimate_bpm(pcm, sample_rate, cancel=None):
+    """Combine per-channel onset envelopes, preserving center and side information."""
+    check_cancel(cancel)
+    data = pcm[:, None] if pcm.ndim == 1 else pcm
+    sr = int(sample_rate)
+    if sr <= 0 or len(data) < sr * 2:
+        return None
+    if len(data) > sr * BPM_MAX_ANALYZE_S:
+        start = (len(data) - sr * BPM_MAX_ANALYZE_S) // 2
+        data = data[start:start + sr * BPM_MAX_ANALYZE_S]
+    if np.max(np.abs(data)) < 1e-4:
+        return None
+    import librosa
+    from scipy.signal import find_peaks
+    from librosa.feature.rhythm import tempo as estimate_tempo
+    envelopes = []
+    for ch in range(data.shape[1]):
+        check_cancel(cancel)
+        y = np.ascontiguousarray(data[:, ch], dtype=np.float32)
         if sr != BPM_TARGET_SR:
             y = librosa.resample(y, orig_sr=sr, target_sr=BPM_TARGET_SR)
-            sr = BPM_TARGET_SR
+        envelopes.append(librosa.onset.onset_strength(y=y, sr=BPM_TARGET_SR,
+                                                       hop_length=BPM_HOP_LENGTH))
+    onset = np.mean(envelopes, axis=0)
+    margin = int(0.25 * BPM_TARGET_SR / BPM_HOP_LENGTH)
+    usable = onset[margin:-margin] if len(onset) > 2 * margin else onset
+    strength = float(np.max(usable)) if usable.size else 0
+    peaks, _ = find_peaks(usable, height=strength * 0.2, prominence=strength * 0.1,
+                         distance=max(1, int(BPM_TARGET_SR / BPM_HOP_LENGTH * 0.15)))
+    if strength < 0.1 or len(peaks) < 3:
+        return None
+    check_cancel(cancel)
+    tempo = estimate_tempo(onset_envelope=onset, sr=BPM_TARGET_SR,
+                                       hop_length=BPM_HOP_LENGTH, aggregate=np.median)
+    check_cancel(cancel)
+    bpm = float(np.atleast_1d(tempo)[0])
+    return bpm if np.isfinite(bpm) and bpm > 0 else None
 
-        t = _tempo(y=y, sr=sr, hop_length=BPM_HOP_LENGTH, aggregate=np.median)
-        bpm = float(np.atleast_1d(t)[0])
-        return bpm if np.isfinite(bpm) else 0.0
 
+def analyze_file(path, cancel=None):
+    res = AnalysisResult(path=os.path.abspath(path), filename=os.path.basename(path))
+    signature = file_signature(path)
+    if signature:
+        res.source_mtime_ns, res.source_size = signature
     try:
-        return _compute()
-    except Exception as e:  # noqa: BLE001
-        # 缓存损坏类错误 → 清理 JIT 缓存后重试一次（自愈）
-        if is_likely_cache_error(e):
-            clear_numba_cache()
-            try:
-                return _compute()
-            except Exception:  # noqa: BLE001
-                return 0.0
-        return 0.0
-
-
-# --------------------------------------------------------------------------- #
-# 汇总入口
-# --------------------------------------------------------------------------- #
-
-def analyze_file(path: str, cancel=None) -> AnalysisResult:
-    """对一个音频文件执行完整测量。
-
-    cancel: 可选回调（无参、返回 bool）。返回 True 表示用户已请求取消，
-            在阶段边界抛出 AnalysisCancelled——用于「停止」按钮对长文件
-            及时响应（不会等到整个文件分析完）。
-    """
-    res = AnalysisResult(path=path, filename=os.path.basename(path))
-
-    def _check_cancel():
-        if cancel is not None and cancel():
-            raise AnalysisCancelled()
-
-    ffmpeg, _ = ensure_ffmpeg()
-    if not ffmpeg:
-        res.error = "未找到 ffmpeg，请先安装：brew install ffmpeg"
-        return res
-
-    # 1. 基础信息
-    _check_cancel()
-    try:
-        info = probe(path)
-        res.sample_rate = info["sample_rate"]
-        res.channels = info["channels"]
-        res.duration = info["duration"]
+        check_cancel(cancel)
+        info = probe(path, cancel=cancel)
+        res.sample_rate, res.channels, res.duration = info["sample_rate"], info["channels"], info["duration"]
     except AnalysisCancelled:
         raise
-    except Exception as e:  # noqa: BLE001
-        res.error = f"读取失败：{e}"
+    except Exception as exc:
+        res.error = f"读取失败：{exc}"
         return res
-
-    # 2. 响度 / LRA / 真峰值
-    _check_cancel()
     try:
-        lufs, lra, tp = measure_loudness(path)
-        res.integrated_lufs = lufs
-        res.loudness_range_lu = lra
-        res.true_peak_dbtp = tp
+        res.integrated_lufs, res.loudness_range_lu, res.true_peak_dbtp = measure_loudness(path, cancel=cancel)
     except AnalysisCancelled:
         raise
-    except Exception as e:  # noqa: BLE001
-        res.error += f"响度测量失败：{e}；"
-
-    # 3. 解码 + 削波 + 速度 + 频谱质心
-    _check_cancel()
+    except Exception as exc:
+        res.error = f"响度测量失败：{exc}"
     try:
-        pcm, sr = decode_pcm(path, res.channels)
+        pcm, sr = decode_pcm(path, res.channels, cancel=cancel)
         res.total_samples = int(pcm.size)
-        _check_cancel()   # 解码完成（耗时阶段之一），及时响应停止
-
-        if pcm.size > 0:
-            peak = float(np.max(np.abs(pcm)))
-            res.sample_peak_dbfs = 20.0 * np.log10(peak) if peak > 0 else float("-inf")
-
-            clipped, total, ranges = detect_clipping(pcm, sr)
-            res.clipped_samples = clipped
-            res.total_samples = total
-            res.clip_percent = clipped / total if total else 0.0
-            res.clipped = len(ranges) > 0   # 以「真削波段」为准（孤立峰值不算）
-            res.clip_ranges = ranges
-
-            # 降混单声道（带反相相消保护，避免反相立体声被当成静音）
-            mono = downmix_mono(pcm)
-            # 速度（BPM）：内部自带异常保护，单点失败不影响其他测量项
-            _check_cancel()   # BPM 前（BPM 为最耗时阶段）
-            res.bpm = estimate_bpm(mono, sr)
-            _check_cancel()
-            # 频谱质心（幅度加权 / 功率加权双口径）
-            (res.centroid_magnitude_hz,
-             res.centroid_power_hz) = spectral_centroids(mono, sr)
+        res.sample_peak_dbfs = sample_peak(pcm, cancel)
+        count, total, ranges = detect_clipping(pcm, sr, cancel=cancel)
+        res.clipped_samples, res.clip_ranges = count, ranges
+        res.clip_percent, res.clipped = count / total, bool(ranges)
+        res.centroid_magnitude_hz, res.centroid_power_hz = spectral_centroids(pcm, sr, cancel=cancel)
+        try:
+            res.bpm = estimate_bpm(pcm, sr, cancel=cancel)
+            if res.bpm is None:
+                res.warnings.append("节拍证据不足或音频过短，未提供 BPM")
+        except AnalysisCancelled:
+            raise
+        except Exception as exc:
+            res.warnings.append(f"BPM 测量不可用：{exc}")
+        if res.duration < 30:
+            res.warnings.append("音频短于 30 秒，LRA/BPM 仅供参考")
+        if res.sample_peak_dbfs is None:
+            res.integrated_lufs = res.loudness_range_lu = res.true_peak_dbtp = None
+            res.warnings.append("纯静音：响度、峰值与频谱指标不适用")
     except AnalysisCancelled:
         raise
-    except Exception as e:  # noqa: BLE001
-        res.error += f"削波/频谱分析失败：{e}"
-
+    except Exception as exc:
+        res.error += ("；" if res.error else "") + f"样本/频谱分析失败：{exc}"
+    check_cancel(cancel)
+    if res.is_stale:
+        res.error += ("；" if res.error else "") + "分析期间源文件发生变化，请重新分析"
     return res
 
 
 def clip_summary(res: AnalysisResult, max_ranges: int = 6) -> str:
     """生成削波情况的可读摘要。"""
+    if res.clipped is None:
+        return "未测量"
     if not res.clipped:
-        return "无满幅削波"
-    parts = [f"占比 {res.clip_percent_display}%"]
+        return "未检出满幅平台（不代表无其他失真）"
+    parts = [f"疑似满幅平台占比 {res.clip_percent_display}%"]
     for i, r in enumerate(res.clip_ranges[:max_ranges]):
         if r.channel > 1:
             parts.append(f"CH{r.channel} {r.start:.2f}–{r.end:.2f}s")
