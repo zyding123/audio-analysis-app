@@ -100,6 +100,10 @@ mkdir -p "$PYINSTALLER_CONFIG_DIR"
   --exclude-module IPython \
   --exclude-module tkinter \
   --exclude-module pytest \
+  --exclude-module torch \
+  --exclude-module torchvision \
+  --exclude-module torchaudio \
+  --exclude-module sklearn \
   main.py
 
 echo "→ 4/4 生成 .dmg 安装镜像..."
