@@ -63,7 +63,7 @@ bash build_macos.sh
 
 `static-ffmpeg` 在首次源码运行时可能下载 FFmpeg。发布的 App 已内置 FFmpeg / ffprobe，用户无需安装 Python 或运行环境。
 
-构建输出位于 `dist/v1.1.0/`：App、DMG、SHA-256 校验文件。DMG 同时包含 Applications 快捷方式。GitHub Actions 在推送代码时检查测试和打包，只有 `v*` 标签通过检查后才发布 Release。
+构建输出位于 `dist/v1.1.0/`：App、DMG、SHA-256 校验文件。DMG 同时包含 Applications 快捷方式。GitHub Actions 在推送代码时检查测试和打包，主分支通过检查后按 `version.py` 创建对应的 Release 和标签；同版本已发布文件不会被覆盖。
 
 ## 项目文件
 
