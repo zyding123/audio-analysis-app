@@ -63,6 +63,13 @@ def _log(msg: str):
 
 
 # =========================================================================
+# 应用版本
+# =========================================================================
+
+APP_VERSION = "1.0.0"   # 首个公开发布版本（与 GitHub Release tag / Info.plist 保持一致）
+
+
+# =========================================================================
 # 国际化（中文 / 英语）
 # =========================================================================
 
@@ -715,7 +722,7 @@ class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent=None):
         super().__init__(parent)
         self.config = config
-        self.setWindowTitle(tr("settings_title"))
+        self.setWindowTitle(f"{tr('settings_title')} · v{APP_VERSION}")
         self.setMinimumWidth(460)
         self.setModal(True)
 
@@ -801,7 +808,7 @@ class SettingsDialog(QDialog):
         root.addLayout(btn_row)
 
     def retranslate(self):
-        self.setWindowTitle(tr("settings_title"))
+        self.setWindowTitle(f"{tr('settings_title')} · v{APP_VERSION}")
         self.gb_appearance.setTitle(tr("group_appearance"))
         self.gb_language.setTitle(tr("group_language"))
         self.gb_analysis.setTitle(tr("group_analysis"))

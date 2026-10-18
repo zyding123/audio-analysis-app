@@ -1,5 +1,7 @@
 # 音频分析（macOS）
 
+> 当前版本 **v1.0.0**（[下载安装](https://github.com/zyding123/audio-analysis-app/releases/latest)）
+
 > 一个离线运行的 macOS 桌面音频**批量分析工具**——面向 AI 音乐标注 / 音频评测场景，
 > 拖入文件即得到客观测量结果（响度、频谱、速度、削波）与频谱图表。
 

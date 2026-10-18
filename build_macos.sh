@@ -106,6 +106,20 @@ mkdir -p "$PYINSTALLER_CONFIG_DIR"
   --exclude-module sklearn \
   main.py
 
+# 注入版本号（PyInstaller 默认写 0.0.0；改完后重新 adhoc 签名，保持签名有效）
+APP_VER="1.0.0"
+APP_BUILD="1"
+PLIST="dist/$APP_NAME.app/Contents/Info.plist"
+if [ -f "$PLIST" ]; then
+  /usr/bin/plutil -replace CFBundleShortVersionString -string "$APP_VER" "$PLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VER" "$PLIST" 2>/dev/null || true
+  /usr/bin/plutil -replace CFBundleVersion -string "$APP_BUILD" "$PLIST" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUILD" "$PLIST" 2>/dev/null || true
+  # 修改 Info.plist 会使原签名失效，重新做 adhoc 签名
+  /usr/bin/codesign --force --deep --sign - "dist/$APP_NAME.app" >/dev/null 2>&1 || true
+  echo "→ 版本号已注入：v$APP_VER"
+fi
+
 echo "→ 4/4 生成 .dmg 安装镜像..."
 hdiutil create \
   -volname "$APP_NAME" \
