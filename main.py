@@ -1230,7 +1230,24 @@ class ChartDialog(QDialog):
     def _read_mtime(self):
         return (file_signature(self.res.path), _LANG)
 
+    def _show_stale_source(self):
+        self._refresh_pending = False
+        self._paths.clear()
+        self._pixmaps.clear()
+        message = "源文件已更新，请重新分析" if _LANG == "zh" else "Source changed; analyze again"
+        self.status_label.setText(message)
+        for label in (self.spec_label, self.curve_label):
+            label.setPixmap(QPixmap())
+            label.setText(message)
+        self.btn_save_spec.setEnabled(False)
+        self.btn_save_curve.setEnabled(False)
+
     def refresh_if_stale(self):
+        if self.res.is_stale:
+            if self._worker is not None:
+                self._worker.stop()
+            self._show_stale_source()
+            return
         if self._read_mtime() == self._file_mtime:
             return
         if self._worker is not None and self._worker.isRunning():
@@ -1286,11 +1303,17 @@ class ChartDialog(QDialog):
         owner = self.parent()
         if getattr(owner, "_closing", False):
             return
+        if self.res.is_stale:
+            self._show_stale_source()
+            return
         if self._refresh_pending or self._generation_key != self._cache_key():
             self._restart()
 
     @Slot(str, str)
     def _on_chart_ready(self, kind, png_path):
+        if self.res.is_stale:
+            self._show_stale_source()
+            return
         if self._generation_key != self._cache_key():
             self._refresh_pending = True
             return
