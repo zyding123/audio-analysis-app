@@ -654,7 +654,6 @@ def _dark_palette() -> QPalette:
 
 def detect_system_dark() -> bool:
     """通过读取系统 plist 检测深浅色（纯 Python，不用 subprocess / Qt 接口）。"""
-    _log("detect_system_dark: 读 plist")
     try:
         import plistlib
         path = os.path.expanduser("~/Library/Preferences/.GlobalPreferences.plist")
@@ -662,7 +661,6 @@ def detect_system_dark() -> bool:
             data = plistlib.load(f)
         style = data.get("AppleInterfaceStyle", "")
         dark = "Dark" in str(style)
-        _log(f"detect_system_dark: style={style!r}, dark={dark}")
         return dark
     except Exception as e:
         _log(f"detect_system_dark: 异常 {e!r}")
