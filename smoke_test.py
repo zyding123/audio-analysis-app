@@ -17,10 +17,15 @@ class MemoryConfig:
 
 def run(module):
     import numpy as np
+    import sys
     import analyzer
     from charts import generate_charts
     from PySide6.QtWidgets import QApplication
     module._log = lambda *args: None
+    if getattr(sys, 'frozen', False):
+        bundle = Path(sys.executable).resolve().parent.parent
+        assert all(Path(binary).resolve().is_relative_to(bundle)
+                   for binary in analyzer.ensure_ffmpeg()), 'Expected bundled ffmpeg/ffprobe' 
     with tempfile.TemporaryDirectory(prefix='audioanalysis-selftest-') as folder:
         root = Path(folder)
         t = np.arange(48000 * 3) / 48000
