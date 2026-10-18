@@ -343,6 +343,25 @@ class GuiTests(unittest.TestCase):
         self.assertEqual(dlg._generation_key, dlg._cache_key())
         self.assertIn(dlg._cache_key(), dlg._cache)
 
+    def test_updated_source_cannot_put_new_charts_next_to_old_measurements(self):
+        def delayed_chart(path, out, name, on_chart=None, lang='zh', cancel=None):
+            for _ in range(30):
+                a.check_cancel(cancel)
+                time.sleep(.005)
+        stamp, size = a.file_signature(str(self.path))
+        r = a.AnalysisResult(path=str(self.path), filename='track.wav',
+                             source_mtime_ns=stamp, source_size=size)
+        with mock.patch.object(charts, 'generate_charts', delayed_chart):
+            self.win._on_result(r, self.win._batch_id)
+            self.win.open_charts_for_row(0)
+            dlg = self.win._chart_dialogs[str(self.path)]
+            wav(self.path, sine(seconds=.2))
+            dlg.refresh_if_stale()
+            self.pump_until(lambda: dlg._worker is None)
+        self.assertEqual(dlg._paths, {})
+        self.assertFalse(dlg.btn_save_spec.isEnabled())
+        self.assertIn('重新分析', dlg.status_label.text())
+
 
 if __name__ == '__main__':
     unittest.main()
