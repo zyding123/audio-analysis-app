@@ -174,7 +174,7 @@ def run_process(cmd, *, cancel=None, stdout=subprocess.PIPE, text=False):
 def _locate_binary(name: str):
     """依次在 PATH、PyInstaller 打包目录、macOS .app 资源目录中查找可执行文件。"""
     exe = shutil.which(name)
-    if exe:
+    if exe and not getattr(sys, "frozen", False):
         return exe
 
     bases = []
@@ -198,7 +198,7 @@ def _locate_binary(name: str):
             cand = os.path.join(base, sub, name)
             if os.path.isfile(cand) and os.access(cand, os.X_OK):
                 return cand
-    return None
+    return exe
 
 
 def ensure_ffmpeg():
