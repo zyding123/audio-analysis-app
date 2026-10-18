@@ -46,7 +46,7 @@ except Exception:  # noqa: BLE001
     _PLAYER_AVAILABLE = False
 
 from analyzer import (
-    AnalysisCancelled, AnalysisResult, analyze_file, clip_summary, ensure_ffmpeg,
+    AnalysisCancelled, AnalysisResult, analyze_file, clip_summary, ensure_ffmpeg, file_signature,
 )
 
 
@@ -66,7 +66,7 @@ def _log(msg: str):
 # 应用版本
 # =========================================================================
 
-APP_VERSION = "1.0.0"   # 首个公开发布版本（与 GitHub Release tag / Info.plist 保持一致）
+from version import APP_VERSION
 
 
 # =========================================================================
@@ -181,9 +181,9 @@ _T = {
     "status_stopped": ("已停止（保留 {n} 个结果）", "Stopped ({n} result(s) kept)"),
     "status_exported": ("已导出：", "Exported: "),
     "export_failed": ("导出失败", "Export failed"),
-    "clip_yes": ("⚠ 有削波", "⚠ Clipped"),
+    "clip_yes": ("⚠ 疑似", "⚠ Suspected"),
     "clip_maybe": ("可能削波", "Possibly clipped"),
-    "clip_ok": ("正常", "OK"),
+    "clip_ok": ("未检出", "Not detected"),
     "no_clip": ("无满幅削波", "No full-scale clipping"),
     "drop_title": ("将音频文件或文件夹拖到这里", "Drop audio files or folders here"),
     "drop_hint": ("支持 WAV / AIFF / FLAC / MP3 / M4A / AAC / OGG 等 · 后台自动分析，无需播放",
@@ -1072,12 +1072,12 @@ class DropZone(QFrame):
 # =========================================================================
 
 class AnalyzeWorker(QThread):
-    result_ready = Signal(object)
-    progress = Signal(int, int)
-    finished_all = Signal()
+    result_ready = Signal(object, int)
+    progress = Signal(int, int, int)
 
-    def __init__(self, files, parent=None):
+    def __init__(self, files, batch_id=0, parent=None):
         super().__init__(parent)
+        self.batch_id = batch_id
         self.files = list(files)
         self._stop = False
 
@@ -1096,9 +1096,10 @@ class AnalyzeWorker(QThread):
             except Exception as e:  # noqa: BLE001
                 res = AnalysisResult(path=f, filename=os.path.basename(f),
                                      error=str(e))
-            self.result_ready.emit(res)
-            self.progress.emit(i + 1, total)
-        self.finished_all.emit()
+            if self._stop:
+                break
+            self.result_ready.emit(res, self.batch_id)
+            self.progress.emit(self.batch_id, i + 1, total)
 
 
 # =========================================================================
@@ -1117,6 +1118,10 @@ class ChartWorker(QThread):
         self.out_dir = out_dir
         self.display_name = display_name
         self.lang = lang
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
 
     def run(self):
         try:
@@ -1124,7 +1129,9 @@ class ChartWorker(QThread):
             generate_charts(
                 self.audio_path, self.out_dir, self.display_name,
                 on_chart=lambda kind, path: self.chart_ready.emit(kind, path),
-                lang=self.lang)
+                lang=self.lang, cancel=lambda: self._stop)
+        except AnalysisCancelled:
+            pass
         except Exception as e:  # noqa: BLE001
             _log(f"ChartWorker 失败: {e!r}")
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -1208,7 +1215,9 @@ class ChartDialog(QDialog):
         btn_row.addWidget(self.btn_close)
         root.addLayout(btn_row)
 
-        self._file_mtime = self._read_mtime()
+        self._file_mtime = None
+        self._generation_key = None
+        self._refresh_pending = False
         self._user_closed = False   # 用户是否已关闭过本窗口（供主窗口 LRU 清理）
         self._start()
 
@@ -1216,22 +1225,21 @@ class ChartDialog(QDialog):
         self._user_closed = True
         super().closeEvent(event)
 
+    def showEvent(self, event):
+        self._user_closed = False
+        super().showEvent(event)
+
     def _read_mtime(self):
-        try:
-            return os.path.getmtime(self.res.path)
-        except OSError:
-            return 0.0
+        return (file_signature(self.res.path), _LANG)
 
     def refresh_if_stale(self):
-        """文件被覆盖/更新后重新生成图表（窗口复用时防止显示旧图）。"""
-        cur = self._read_mtime()
-        if cur == self._file_mtime:
+        if self._read_mtime() == self._file_mtime:
             return
-        self._file_mtime = cur
-        _log(f"ChartDialog: 检测到文件已更新，重新生成 {self.res.path}")
-        if self._worker is None or not self._worker.isRunning():
+        if self._worker is not None and self._worker.isRunning():
+            self._refresh_pending = True
+            self._worker.stop()
+        else:
             self._restart()
-        # 若生成仍在进行：不打断（下次打开窗口时会再次校验）
 
     def _restart(self):
         """清空旧图并重新开始生成。"""
@@ -1248,32 +1256,46 @@ class ChartDialog(QDialog):
 
     # ---- 生成流程 ----
     def _cache_key(self):
-        try:
-            mtime = os.path.getmtime(self.res.path)
-        except OSError:
-            mtime = 0
-        return (self.res.path, mtime)
+        return (self.res.path, self._read_mtime())
 
     def _start(self):
         if self._worker is not None and self._worker.isRunning():
             return
-        cached = self._cache.get(self._cache_key())
-        if cached and all(os.path.isfile(p) for p in cached.values()):
-            _log("ChartDialog: 命中缓存，直接显示")
+        self._generation_key = self._cache_key()
+        self._file_mtime = self._read_mtime()
+        self._refresh_pending = False
+        cached = self._cache.get(self._generation_key)
+        if cached and set(cached) == {"spectrogram", "spectrum"} and all(os.path.isfile(p) for p in cached.values()):
             for kind, path in cached.items():
                 self._on_chart_ready(kind, path)
             self.status_label.setText(tr("chart_done"))
             return
-
-        out_dir = os.path.join(tempfile.gettempdir(), "audioanalysis_charts")
-        self._worker = ChartWorker(self.res.path, out_dir,
-                                   self.res.filename, lang=_LANG, parent=self)
+        owner = self.parent()
+        out_dir = owner._chart_tempdir.name
+        self._worker = ChartWorker(self.res.path, out_dir, self.res.filename,
+                                   lang=_LANG, parent=self)
         self._worker.chart_ready.connect(self._on_chart_ready)
         self._worker.failed.connect(self._on_failed)
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    @Slot()
+    def _on_worker_finished(self):
+        worker = self._worker
+        self._worker = None
+        if worker is not None:
+            worker.deleteLater()
+        owner = self.parent()
+        if getattr(owner, "_closing", False):
+            return
+        if self._refresh_pending or self._generation_key != self._cache_key():
+            self._restart()
 
     @Slot(str, str)
     def _on_chart_ready(self, kind, png_path):
+        if self._generation_key != self._cache_key():
+            self._refresh_pending = True
+            return
         self._paths[kind] = png_path
         pm = QPixmap(png_path)
         if not pm.isNull():
@@ -1285,10 +1307,14 @@ class ChartDialog(QDialog):
         else:
             self.btn_save_curve.setEnabled(not pm.isNull())
             self.status_label.setText(tr("chart_done"))
-            self._cache[self._cache_key()] = dict(self._paths)
+            self._cache[self._generation_key] = dict(self._paths)
+            while len(self._cache) > 24:
+                self._cache.pop(next(iter(self._cache)))
 
     @Slot(str)
     def _on_failed(self, msg):
+        if self._generation_key != self._cache_key():
+            return
         self.status_label.setText(tr("chart_gen_failed"))
         for lb in (self.spec_label, self.curve_label):
             lb.setText("⚠️ " + tr("chart_gen_failed") + msg)
@@ -1347,6 +1373,8 @@ class MainWindow(QMainWindow):
         self._pending_files = []
         self._stop_requested = False
         self._batch_id = 0         # 任务批次代际：作废旧批次的残留信号
+        self._closing = False
+        self._chart_tempdir = tempfile.TemporaryDirectory(prefix="audioanalysis-charts-")
         self._really_quit = False  # 仅 Dock 右键退出 / Cmd+Q 时为 True
         self._results = []         # 数据源（持久化到磁盘）
         self._selection_mode = False  # 多选模式
@@ -1590,6 +1618,8 @@ class MainWindow(QMainWindow):
 
     def analyze_from_library(self, path: str):
         """双击曲库条目 → 加入右侧分析队列开始分析。"""
+        if self._closing:
+            return
         if not os.path.isfile(path):
             self.status.setText(tr("status_file_missing") + path)
             return
@@ -1675,29 +1705,33 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
 
+    def shutdown(self):
+        """All quit paths cancel and join workers before Qt destroys their parents."""
+        if self._closing:
+            return
+        self._closing = self._really_quit = True
+        self._pending_files = []
+        self._batch_id += 1
+        self._theme_timer.stop()
+        self._stop_playback()
+        workers = ([self._worker] if self._worker is not None else [])
+        workers.extend(dlg._worker for dlg in self._chart_dialogs.values()
+                       if dlg._worker is not None)
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            worker.wait()  # No nested event loop while QObject parents are being shut down.
+        self._chart_tempdir.cleanup()
+
     def quit_app(self):
-        """真正退出：先允许关闭，再触发 quit。"""
-        _log("quit_app: 准备真正退出")
-        self._really_quit = True
-        # 停止并等待后台线程结束，避免 QThread 在运行中被销毁（退出警告/崩溃风险）
-        if self._worker is not None:
-            try:
-                self._worker.stop()
-                self._worker.wait(5000)
-            except Exception:  # noqa: BLE001
-                pass
-        for dlg in list(self._chart_dialogs.values()):
-            w = getattr(dlg, "_worker", None)
-            if w is not None:
-                try:
-                    w.wait(8000)   # 图表生成无法中断，尽力等待完成
-                except Exception:  # noqa: BLE001
-                    pass
+        self.shutdown()
         QApplication.instance().quit()
 
     # ----------------------------------------------------------------- 任务
     @Slot(list)
     def add_files(self, paths):
+        if self._closing:
+            return
         files = collect_audio_files(paths)
         if not files:
             self.status.setText(tr("status_no_audio"))
@@ -1707,6 +1741,9 @@ class MainWindow(QMainWindow):
             self.library_panel.add_paths(files)
         # 若设置为不追加，则清空旧结果再分析（同时作废旧批次的残留信号）
         if not self.config.get(AppConfig.KEY_APPEND_ON_DROP):
+            if self._worker is not None:
+                self._worker.stop()
+            self._stop_playback()
             self._batch_id += 1
             self._pending_files = []
             self._results = []
@@ -1726,7 +1763,7 @@ class MainWindow(QMainWindow):
         # result/finished 信号仍在事件队列中未处理。此时若直接启动新 worker，
         # 旧 worker 排队的“最后一批结果”会因代际过期被丢弃（快速连续导入丢文件）。
         # 因此只要引用还在（= 其 finished 信号尚未处理完），就等待接力。
-        if self._worker is not None:
+        if self._closing or self._worker is not None:
             return
         if not self._pending_files:
             return
@@ -1741,11 +1778,10 @@ class MainWindow(QMainWindow):
         self.btn_open.setEnabled(False)
         self.status.setText(tr("status_analyzing"))
 
-        self._worker = AnalyzeWorker(batch)
-        # 通过 lambda 捕获批次号：过期批次的信号在处理器里被丢弃
-        self._worker.result_ready.connect(lambda r, w=wid: self._on_result(r, w))
-        self._worker.progress.connect(lambda d, t, w=wid: self._on_progress(w, d, t))
-        self._worker.finished_all.connect(lambda w=wid: self._on_finished(w))
+        self._worker = AnalyzeWorker(batch, batch_id=wid, parent=self)
+        self._worker.result_ready.connect(self._on_result)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
     @Slot(object, int)
@@ -1765,29 +1801,31 @@ class MainWindow(QMainWindow):
             self.progress.setValue(int(done / total * 100))
             self.status.setText(tr("status_progress", done=done, total=total))
 
-    @Slot(int)
-    def _on_finished(self, wid: int):
-        self._worker = None
-        if wid != self._batch_id:
-            # 过期批次结束：其信号已全部作废；若有等待中的新文件，接力启动
-            if self._pending_files:
-                self._start_worker()
+    @Slot()
+    def _on_worker_finished(self):
+        worker = self.sender()
+        if worker is not self._worker:
             return
-        # 当前批次：如有等待中的新文件则接力，否则正常收尾
+        self._worker = None
+        wid = worker.batch_id
+        worker.deleteLater()
+        if self._closing:
+            return
         if self._pending_files:
             self._start_worker()
             return
-        self.progress.setValue(100)
+        self.btn_stop.setEnabled(False)
+        self.btn_open.setEnabled(True)
         if self._stop_requested:
             self._stop_requested = False
             self.status.setText(tr("status_stopped", n=len(self._results)))
-        else:
+        elif wid == self._batch_id:
+            self.progress.setValue(100)
             self.status.setText(tr("status_done", n=len(self._results)))
-        self.btn_stop.setEnabled(False)
-        self.btn_open.setEnabled(True)
         self._update_buttons()
 
     def stop_analysis(self):
+        self._batch_id += 1
         self._stop_requested = True
         self._pending_files = []   # 停止 = 同时取消尚未开始的文件（立即生效）
         if self._worker is not None:
@@ -1806,6 +1844,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status.setText(tr("status_cleared"))
         self._save_results()
+        self.btn_open.setEnabled(self._worker is None)
+        self.btn_stop.setEnabled(self._worker is not None)
         self._update_buttons()
 
     # ----------------------------------------------------------------- 播放
@@ -1880,6 +1920,9 @@ class MainWindow(QMainWindow):
             self.status.setText(tr("status_file_missing") + res.path)
             return
 
+        if res.is_stale:
+            self.status.setText("源文件已更新，请重新分析后试听对应记录")
+            return
         state = self._player.playbackState()
         same_file = (res.path == self._player_source_path)
         if same_file:
@@ -2014,6 +2057,8 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------------------------- 图表
     def open_charts_for_row(self, row, column=0):
         """双击表格行：打开该记录的频谱图表窗口（非模态，可多开）。"""
+        if self._closing:
+            return
         item = self.table.item(row, 0)
         res = item.data(Qt.UserRole) if item is not None else None
         if not isinstance(res, AnalysisResult):
@@ -2021,9 +2066,13 @@ class MainWindow(QMainWindow):
         if not os.path.isfile(res.path):
             self.status.setText(tr("status_file_missing") + res.path)
             return
+        if res.is_stale:
+            self.status.setText("源文件已更新，请重新分析后查看图表")
+            return
         dlg = self._chart_dialogs.get(res.path)
         if dlg is not None:
             # 已有窗口：文件若已被覆盖/更新则重新生成，再激活（防显示旧图）
+            dlg.res = res
             dlg.refresh_if_stale()
             dlg.show()
             dlg.raise_()
@@ -2043,7 +2092,7 @@ class MainWindow(QMainWindow):
         if len(self._chart_dialogs) <= limit:
             return
         for path, dlg in list(self._chart_dialogs.items()):
-            if path == keep or not getattr(dlg, "_user_closed", False):
+            if path == keep or dlg.isVisible() or not getattr(dlg, "_user_closed", False):
                 continue
             w = getattr(dlg, "_worker", None)
             if w is not None and w.isRunning():
@@ -2057,143 +2106,61 @@ class MainWindow(QMainWindow):
     def _render_row(self, res: AnalysisResult):
         row = self.table.rowCount()
         self.table.insertRow(row)
+        stale = res.is_stale
+        messages = list(res.warnings)
+        if res.error:
+            messages.append(res.error)
+        if stale:
+            messages.append("源文件已更新或不存在，请重新分析")
+        tip = "\n".join([res.path] + messages)
+        name = res.filename + (" ⚠" if messages else "")
+        item = QTableWidgetItem(name)
+        item.setData(Qt.UserRole, res)
+        item.setToolTip(tip)
+        if res.error or stale:
+            item.setForeground(QColor("#d9534f"))
+        self.table.setItem(row, 0, item)
 
-        def cell(text, color=None, align=None, tooltip=None):
-            item = QTableWidgetItem(text)
+        def put(col, text, color=None, tooltip=None):
+            cell = QTableWidgetItem(text)
+            cell.setToolTip(tooltip or tip)
             if color:
-                item.setForeground(QColor(color))
-            if align:
-                item.setTextAlignment(align)
-            if tooltip:
-                item.setToolTip(tooltip)
-            return item
+                cell.setForeground(QColor(color))
+            cell.setTextAlignment(Qt.AlignCenter if col in (2, 8) else Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(row, col, cell)
 
-        failed = bool(res.error)
-        gray = "#888888"
-        na = "—"
-        na_tip = "分析失败，不可用" if failed else "无有效值（如纯静音）"
+        def valid(v):
+            return not stale and v is not None and math.isfinite(v)
 
-        def finite(v):
-            try:
-                return math.isfinite(float(v))
-            except (TypeError, ValueError):
-                return False
+        def number(col, value, spec, suffix="", color=None):
+            put(col, format(value, spec) + suffix if valid(value) else "—",
+                color if valid(value) else "#888888")
 
-        # 文件名（⚠ 失败提示并入同一单元格；结果对象始终挂回第一列，
-        # 保证播放 / 图表 / 导出等入口不受失败状态影响）
-        name_text = res.filename
-        name_color = None
-        name_tip = res.path
-        if failed:
-            name_text = f"{res.filename} ⚠ {res.error}"
-            name_color = "#d9534f"
-            name_tip = res.error
-        name_item = cell(name_text, color=name_color, tooltip=name_tip)
-        name_item.setData(Qt.UserRole, res)
-        self.table.setItem(row, 0, name_item)
-
-        # 时长
-        if res.duration and res.duration > 0:
-            self.table.setItem(row, 1, cell(f"{res.duration:.1f}s",
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-        else:
-            self.table.setItem(row, 1, cell(na, color=gray, tooltip=na_tip,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-        # 声道/采样率
-        if res.sample_rate and res.channels:
-            sr = f"{res.sample_rate / 1000:.1f}k"
-            self.table.setItem(row, 2, cell(f"{res.channels}ch · {sr}",
-                                            align=Qt.AlignCenter))
-        else:
-            self.table.setItem(row, 2, cell(na, color=gray, tooltip=na_tip,
-                                            align=Qt.AlignCenter))
-
-        # LUFS 积分响度（<= -70 视为无有效信号：ffmpeg 对全静音的哨兵值）
-        lv = res.integrated_lufs
-        if (failed and lv == 0.0) or not finite(lv) or lv <= -70.0:
-            # 失败未测 / 纯静音（-inf）
-            self.table.setItem(row, 3, cell(na, color=gray, tooltip=na_tip,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-        else:
-            lufs_str = f"{lv:+.1f}"
-            target = float(self.config.get(AppConfig.KEY_TARGET_LUFS))
-            if abs(lv - target) > 2.0:
-                lufs_str += f" (与 {target:+.0f} 偏差 {lv - target:+.1f})"
-            self.table.setItem(row, 3, cell(lufs_str,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-
-        # LRA（短音频参考性提示）
-        la = res.loudness_range_lu
-        if (failed and la == 0.0) or not finite(la):
-            self.table.setItem(row, 4, cell(na, color=gray, tooltip=na_tip,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-        else:
-            lra_cell = cell(f"{la:.1f}", align=Qt.AlignRight | Qt.AlignVCenter)
-            if res.duration and res.duration < 30:
-                lra_cell.setToolTip("音频较短（< 30 秒），LRA 参考性有限")
-            self.table.setItem(row, 4, lra_cell)
-
-        # 真峰值
+        number(1, res.duration if res.duration > 0 else None, ".1f", "s")
+        put(2, f"{res.channels}ch · {res.sample_rate / 1000:.1f}k" if res.channels and not stale else "—")
+        target = float(self.config.get(AppConfig.KEY_TARGET_LUFS))
+        suffix = ""
+        if valid(res.integrated_lufs) and abs(res.integrated_lufs - target) > 2:
+            suffix = f" (Δ {res.integrated_lufs - target:+.1f})"
+        number(3, res.integrated_lufs, "+.1f", suffix)
+        number(4, res.loudness_range_lu, ".1f")
+        threshold = float(self.config.get(AppConfig.KEY_TRUE_PEAK_WARN))
         tp = res.true_peak_dbtp
-        if (failed and tp == 0.0) or not finite(tp):
-            self.table.setItem(row, 5, cell(na, color=gray, tooltip=na_tip,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
+        color = None if not valid(tp) else ("#d9534f" if tp > 0 else "#e6a23c" if tp > threshold else None)
+        number(5, tp, "+.1f", color=color)
+        number(6, res.centroid_magnitude_hz, ".0f")
+        number(7, res.centroid_power_hz, ".0f")
+        if stale or res.clipped is None:
+            put(8, "—", "#888888")
+            put(9, "—", "#888888")
         else:
-            tp_warn = float(self.config.get(AppConfig.KEY_TRUE_PEAK_WARN))
-            tp_color = "#d9534f" if tp > 0 else ("#e6a23c" if tp > tp_warn else None)
-            self.table.setItem(row, 5, cell(f"{tp:+.1f}", color=tp_color,
-                                            align=Qt.AlignRight | Qt.AlignVCenter))
-
-        # 频谱质心·幅度加权（行业标准口径）
-        if res.centroid_magnitude_hz > 0:
-            mag_cell = cell(f"{res.centroid_magnitude_hz:.0f}",
-                            align=Qt.AlignRight | Qt.AlignVCenter)
-        else:
-            mag_cell = cell(na, color=gray, align=Qt.AlignRight | Qt.AlignVCenter,
-                            tooltip=na_tip)
-        self.table.setItem(row, 6, mag_cell)
-        # 频谱质心·功率加权
-        if res.centroid_power_hz > 0:
-            pow_cell = cell(f"{res.centroid_power_hz:.0f}",
-                            align=Qt.AlignRight | Qt.AlignVCenter)
-        else:
-            pow_cell = cell(na, color=gray, align=Qt.AlignRight | Qt.AlignVCenter,
-                            tooltip=na_tip)
-        self.table.setItem(row, 7, pow_cell)
-
-        # 削波状态：失败/未测量显示占位，绝不显示绿色“正常”误导
-        if res.clipped:
-            clip_cell = cell(tr("clip_yes"), color="#d9534f", align=Qt.AlignCenter)
-        elif failed:
-            clip_cell = cell(na, color=gray, align=Qt.AlignCenter, tooltip=na_tip)
-        elif not res.true_peak_ok:
-            clip_cell = cell(tr("clip_maybe"), color="#e6a23c", align=Qt.AlignCenter)
-        else:
-            clip_cell = cell(tr("clip_ok"), color="#5cb85c", align=Qt.AlignCenter)
-        self.table.setItem(row, 8, clip_cell)
-        # 削波详情（显示精简版；完整内容进 tooltip，防列宽截断）
-        if res.clipped:
-            detail_cell = cell(clip_summary(res),
-                               tooltip=clip_summary(res, max_ranges=999))
-        elif failed:
-            detail_cell = cell(na, color=gray, tooltip=na_tip)
-        else:
-            detail_cell = cell(clip_summary(res))
-        self.table.setItem(row, 9, detail_cell)
-
-        # BPM（速度，整数显示；原值进 tooltip）
-        if res.bpm and res.bpm > 0:
-            bpm_tip = f"检测原值 {res.bpm:.1f} BPM"
-            if res.duration and res.duration < 30:
-                bpm_tip += " · 音频较短，结果仅供参考"
-            bpm_cell = cell(f"{int(res.bpm + 0.5)}",
-                            align=Qt.AlignRight | Qt.AlignVCenter,
-                            tooltip=bpm_tip)
-        else:
-            bpm_cell = cell(na, color=gray, align=Qt.AlignRight | Qt.AlignVCenter,
-                            tooltip=("未检出或不可用" if not failed
-                                     else na_tip))
-        self.table.setItem(row, 10, bpm_cell)
+            text = tr("clip_yes") if res.clipped else tr("clip_maybe") if res.true_peak_ok is False else tr("clip_ok")
+            put(8, text, "#d9534f" if res.clipped else "#e6a23c" if res.true_peak_ok is False else None,
+                tooltip=tip + "\n满幅平台/样本越界检测属于疑似提示，不代表听感失真判决")
+            put(9, clip_summary(res), tooltip=tip + "\n" + clip_summary(res, max_ranges=999))
+        number(10, res.bpm, ".0f")
+        if valid(res.bpm):
+            self.table.item(row, 10).setToolTip(tip + f"\n{res.bpm:.1f} BPM · 自动节拍估计，仍需人工复核")
 
     # ------------------------------------------------------------- 持久化
     def _results_file(self) -> str:
@@ -2203,7 +2170,7 @@ class MainWindow(QMainWindow):
         try:
             path = self._results_file()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            data = [r.to_dict() for r in self._results]
+            data = [r.to_dict(for_export=False) for r in self._results]
             # 原子写：先写临时文件再替换，避免中途中断导致 JSON 半写损坏
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -2296,45 +2263,31 @@ class MainWindow(QMainWindow):
         return list(self._results)
 
     def _write_csv(self, path, results):
-        header = _CSV_HEADERS.get(_LANG, _CSV_HEADERS["zh"])
-
-        def num(v, spec):
-            """CSV 数值：非有限值（-inf 等）与缺失值输出为空。"""
-            try:
-                if v is None or not math.isfinite(float(v)):
-                    return ""
-            except (TypeError, ValueError):
-                return ""
-            return format(v, spec)
-
-        yes = "是" if _LANG == "zh" else "Yes"
-        no = "否" if _LANG == "zh" else "No"
+        header = list(_CSV_HEADERS.get(_LANG, _CSV_HEADERS["zh"])) + ["Warnings", "Analysis Version", "Source mtime(ns)", "Source size(bytes)", "Source changed"]
+        def num(value, spec):
+            return "" if value is None else format(value, spec)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(header)
+            writer = csv.writer(f)
+            writer.writerow(header)
             for res in results:
-                if res is None:
-                    continue
-                w.writerow([
-                    res.filename, res.path, f"{res.duration:.3f}",
-                    res.channels, res.sample_rate,
-                    num(res.integrated_lufs, ".2f"),
-                    num(res.loudness_range_lu, ".2f"),
-                    num(res.true_peak_dbtp, ".2f"),
-                    num(res.sample_peak_dbfs, ".2f"),
-                    f"{res.centroid_magnitude_hz:.1f}",
-                    f"{res.centroid_power_hz:.1f}",
-                    yes if res.clipped else no,
-                    res.clipped_samples, f"{res.clip_percent_display:.4f}",
-                    clip_summary(res, max_ranges=100),
-                    f"{res.bpm:.1f}" if res.bpm > 0 else "",
-                    res.error,
+                d = res.to_dict()
+                clip = d["clipped"]
+                writer.writerow([
+                    res.filename, res.path, num(res.duration, ".3f"), res.channels, res.sample_rate,
+                    num(d["integrated_lufs"], ".2f"), num(d["loudness_range_lu"], ".2f"),
+                    num(d["true_peak_dbtp"], ".2f"), num(d["sample_peak_dbfs"], ".2f"),
+                    num(d["centroid_magnitude_hz"], ".1f"), num(d["centroid_power_hz"], ".1f"),
+                    "" if clip is None else ("是" if clip else "否") if _LANG == "zh" else ("Yes" if clip else "No"),
+                    d["clipped_samples"] if clip is not None else "",
+                    num(d["clip_percent_display"], ".4f"),
+                    "" if clip is None else clip_summary(res, max_ranges=100),
+                    num(d["bpm"], ".1f"), d["error"], "；".join(res.warnings), res.analysis_version,
+                    res.source_mtime_ns, res.source_size, d["source_changed"],
                 ])
 
     def _write_json(self, path, results):
-        data = [r.to_dict() for r in results if r is not None]
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+            json.dump([r.to_dict() for r in results], f, ensure_ascii=False, indent=2, allow_nan=False)
 
     # ----------------------------------------------------------------- ffmpeg
     def _check_ffmpeg(self):
@@ -2387,6 +2340,9 @@ class DockReopenFilter(QObject):
 
 
 def main():
+    if "--self-test" in sys.argv:
+        from smoke_test import run
+        return run(sys.modules[__name__])
     _log("main: 开始启动")
     app = QApplication(sys.argv)
     app.setApplicationName("音频分析")
@@ -2416,10 +2372,7 @@ def main():
     app.installEventFilter(win)
 
     # Dock 右键「退出」/ Cmd+Q 时，允许窗口真正关闭
-    def _on_about_to_quit():
-        _log("main: aboutToQuit，设置 _really_quit=True")
-        win._really_quit = True
-    app.aboutToQuit.connect(_on_about_to_quit)
+    app.aboutToQuit.connect(win.shutdown)
 
     win.show()
     _log("main: 进入事件循环")
@@ -2427,4 +2380,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
