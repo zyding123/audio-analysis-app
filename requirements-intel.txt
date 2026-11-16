@@ -1,0 +1,16 @@
+# Intel（x86_64）macOS 专用依赖集。
+#
+# 原因：llvmlite 从 0.46 起不再发布 macOS x86_64 的 wheel（只有 arm64），
+# 而 numba 0.67 强依赖 llvmlite 0.67 → 在 Intel Mac 上只能源码编译（需要 LLVM，CI 会失败）。
+# numba 0.62 使用 llvmlite 0.45（提供 cp310~cp313 的 macosx x86_64 wheel），
+# 且要求 numpy<2.4，因此这里固定 numpy 2.2.x。其余依赖与主 requirements.txt 一致。
+
+numpy==2.2.6
+scipy==1.18.1
+PySide6-Essentials==6.11.2
+PySide6-Addons==6.11.2
+static-ffmpeg==3.0
+librosa==1.0.0
+matplotlib==3.11.1
+numba==0.62.0
+soundfile==0.14.0
