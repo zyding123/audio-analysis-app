@@ -4,20 +4,32 @@
 
 ## 下载与安装
 
-在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.2.0**：
+在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.2.1**：
 
-- **Windows x64**：`audio-analysis-v1.2.0-windows-x64-setup.exe`，双击安装（中英文向导），自带 ffmpeg、开始菜单/桌面快捷方式与卸载程序。安装包未签名，首次运行如遇 SmartScreen 提示请选择「更多信息 → 仍要运行」。
-- **macOS（Apple Silicon）**：`audio-analysis-v1.2.0-macos-arm64.dmg`，打开后将“音频分析”拖入 Applications；临时签名，首次打开可能需要在「系统设置 → 隐私与安全性」中允许。
+- **macOS · Apple Silicon（M 系列）**：`audio-analysis-v1.2.1-macos-arm64.dmg`，打开后将“音频分析”拖入 Applications。
+- **macOS · Intel**：`audio-analysis-v1.2.1-macos-x86_64.dmg`，同上。
+- **Windows x64**：`audio-analysis-v1.2.1-windows-x64-setup.exe`，双击安装（中英文向导），自带 ffmpeg、开始菜单/桌面快捷方式与卸载程序。
+
+> macOS 两个包不可互换：左上角  →「关于本机」→ 芯片一栏可确认是「Intel」还是「Apple M 系列」。
+> 安装包未做代码签名：Windows 首次运行如遇 SmartScreen 提示请选「更多信息 → 仍要运行」；
+> macOS 首次打开可能需要在「系统设置 → 隐私与安全性」中允许。
 
 应用仅做本地处理，不上传音频。
 
 ![主界面](screenshots/main.png)
 
+## v1.2.1 更新
+
+- **新增 Intel（x86_64）Mac 原生构建**（`macos-15-intel` 机器上构建，PyInstaller 不支持跨架构编译）。
+- 三个平台（Apple Silicon / Intel / Windows x64）由 CI 分别原生构建、统一发布，全部附 SHA-256。
+- 构建脚本按构建机架构自动命名产物（`-arm64` / `-x86_64`）。
+
 ## v1.2.0 更新
 
-- **新增 Windows x64 版本**：同一套测量引擎与界面，功能对齐 macOS 版，可直接安装。
-- Windows 平台适配：`%APPDATA%` 数据目录、`%LOCALAPPDATA%` 日志、注册表主题跟随、关闭即退出；ffmpeg 子进程隐藏控制台窗口，临时解码文件自动清理。
-- 双平台 CI：GitHub Actions 在 macOS 与 Windows 上分别跑回归测试、打包与包内自检，统一发布到 Release（附带 SHA-256 校验文件）。
+- 新增 Windows x64 版本：同一套测量引擎与界面，可直接安装。
+- Windows 平台适配：`%APPDATA%` 数据目录、`%LOCALAPPDATA%` 日志、注册表主题跟随、关闭即退出；
+  ffmpeg 子进程隐藏控制台窗口，临时解码文件自动清理。
+- 双平台 CI：GitHub Actions 在 macOS 与 Windows 上分别跑回归测试、打包与包内自检。
 
 ### v1.1.0 的主要修复（沿用）
 

@@ -52,6 +52,47 @@ jobs:
           name: macos-arm64-installer
           path: dist/**/*.dmg*
 
+  macos_intel:
+    # Intel Mac 版本：PyInstaller 无法交叉编译，必须在 x86_64 机器上原生构建
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Verify runner architecture
+        run: uname -m
+      - name: Configure temporary caches
+        run: |
+          echo "MPLCONFIGDIR=$RUNNER_TEMP/matplotlib" >> "$GITHUB_ENV"
+          echo "NUMBA_CACHE_DIR=$RUNNER_TEMP/numba" >> "$GITHUB_ENV"
+      - name: Install tested dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Locate bundled ffmpeg for tests
+        run: |
+          python - <<'PY'
+          import contextlib, io, os, shutil
+          import static_ffmpeg
+          with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+              static_ffmpeg.add_paths()
+          with open(os.environ['GITHUB_PATH'], 'a') as f:
+              f.write(os.path.dirname(shutil.which('ffmpeg')) + '\n')
+          PY
+      - name: Run regression checks
+        run: python -m unittest discover -s tests -v
+      - name: Build, sign and smoke-test application
+        env:
+          PY: python
+        run: bash build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-x86_64-installer
+          path: dist/**/*.dmg*
+
   windows:
     runs-on: windows-latest
     timeout-minutes: 45
@@ -98,7 +139,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
-    needs: [macos, windows]
+    needs: [macos, macos_intel, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -107,7 +148,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: macos-arm64-installer
-          path: release-assets/macos
+          path: release-assets/macos-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-x86_64-installer
+          path: release-assets/macos-x86_64
       - uses: actions/download-artifact@v4
         with:
           name: windows-x64-installer
@@ -122,8 +167,8 @@ jobs:
             test "${GITHUB_REF_NAME}" = "${tag}"
           fi
           mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.sha256' \) | sort)
-          if [ "${#assets[@]}" -lt 2 ]; then
-            echo "No installers produced; aborting." >&2
+          if [ "${#assets[@]}" -lt 3 ]; then
+            echo "Insufficient installers produced; aborting." >&2
             exit 1
           fi
           echo "Assets to publish:"
@@ -133,6 +178,6 @@ jobs:
             gh release upload "${tag}" --clobber "${assets[@]}"
           else
             gh release create "${tag}" --target "${GITHUB_SHA}" --latest \
-              --title "v${version} 音频分析（macOS · Apple Silicon / Windows x64）" \
+              --title "v${version} 音频分析（macOS Intel / Apple Silicon · Windows x64）" \
               --notes-file RELEASE_NOTES.md "${assets[@]}"
           fi

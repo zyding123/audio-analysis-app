@@ -18,6 +18,13 @@ if ! /usr/bin/lipo -version >/dev/null 2>&1; then
 fi
 APP_VER="$("$PY" -c 'from version import APP_VERSION; print(APP_VERSION)')"
 APP_BUILD="$("$PY" -c 'from version import APP_BUILD; print(APP_BUILD)')"
+# 按构建机架构命名产物（PyInstaller 无法交叉编译，必须在目标架构上原生构建）
+case "$(uname -m)" in
+  arm64|aarch64) ARCH_TAG="arm64" ;;
+  x86_64|amd64)  ARCH_TAG="x86_64" ;;
+  *)             ARCH_TAG="$(uname -m)" ;;
+esac
+echo "→ 构建架构: $(uname -m) (产物标记: ${ARCH_TAG})"
 FFMPEG_BIN_DIR="$("$PY" - <<'PY'
 import contextlib, io, os, shutil
 import static_ffmpeg
@@ -53,7 +60,7 @@ STAGING="$BUILD_ROOT/installer"
 mkdir -p "$STAGING"
 /usr/bin/ditto "$APP" "$STAGING/$APP_NAME.app"
 ln -sfn /Applications "$STAGING/Applications"
-DMG="$DIST_ROOT/audio-analysis-v$APP_VER-macos-arm64.dmg"
+DMG="$DIST_ROOT/audio-analysis-v$APP_VER-macos-$ARCH_TAG.dmg"
 hdiutil create -volname "$APP_NAME v$APP_VER" -srcfolder "$STAGING" -ov -format UDZO "$DMG"
 "$PY" - "$DMG" <<'PY'
 import hashlib, sys
