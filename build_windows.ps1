@@ -44,7 +44,7 @@ $env:PYINSTALLER_CONFIG_DIR = if ($env:PYINSTALLER_CONFIG_DIR) { $env:PYINSTALLE
     --specpath $BuildRoot `
     --distpath $DistRoot `
     --name $AppName `
-    --version-file version_info.txt `
+    --version-file (Resolve-Path "version_info.txt").Path `
     --add-binary "$Ffmpeg;." `
     --add-binary "$Ffprobe;." `
     --exclude-module pandas `
