@@ -1,4 +1,4 @@
-# Build and verify a self-contained Windows application and Inno Setup installer.
+﻿# Build and verify a self-contained Windows application and Inno Setup installer.
 # 用法（在仓库根目录）：powershell -ExecutionPolicy Bypass -File build_windows.ps1
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
