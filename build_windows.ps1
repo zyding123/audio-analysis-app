@@ -45,8 +45,8 @@ $env:PYINSTALLER_CONFIG_DIR = if ($env:PYINSTALLER_CONFIG_DIR) { $env:PYINSTALLE
     --distpath $DistRoot `
     --name $AppName `
     --version-file (Resolve-Path "version_info.txt").Path `
-    --add-binary "$Ffmpeg;." `
-    --add-binary "$Ffprobe;." `
+    --add-binary "$Ffmpeg;ffmpeg.exe" `
+    --add-binary "$Ffprobe;ffprobe.exe" `
     --exclude-module pandas `
     --exclude-module IPython `
     --exclude-module tkinter `
@@ -61,6 +61,17 @@ if ($LASTEXITCODE -ne 0) { throw "PyInstaller 构建失败" }
 $AppDir = Join-Path $DistRoot $AppName
 $AppExe = Join-Path $AppDir "$AppName.exe"
 if (!(Test-Path $AppExe)) { throw "缺少 $AppExe" }
+
+# 诊断：确认 ffmpeg/ffprobe 已被打进包
+$bundled = Get-ChildItem $AppDir -Recurse -Include "ffmpeg.exe", "ffprobe.exe" -ErrorAction SilentlyContinue
+if (!$bundled) {
+    Write-Host "⚠️ 包内未找到 ffmpeg/ffprobe，_internal 内容："
+    Get-ChildItem (Join-Path $AppDir "_internal") -ErrorAction SilentlyContinue |
+        Select-Object -First 25 | ForEach-Object { Write-Host "   $($_.Name)" }
+    throw "ffmpeg/ffprobe 未打包进应用目录"
+}
+Write-Host "→ 包内二进制："
+$bundled | ForEach-Object { Write-Host "   $($_.FullName)" }
 
 # 包内自检：验证包内 ffmpeg、分析链路、图表与 UI（数据写入临时目录）
 $env:QT_QPA_PLATFORM = "offscreen"
