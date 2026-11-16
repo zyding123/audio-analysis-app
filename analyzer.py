@@ -147,8 +147,12 @@ def check_cancel(cancel):
 def run_process(cmd, *, cancel=None, stdout=subprocess.PIPE, text=False):
     """Poll a child process so Stop can terminate ffprobe/ffmpeg mid-file."""
     check_cancel(cancel)
+    # Windows：GUI 程序直接调用控制台子进程会闪黑框，需要隐藏子进程窗口
+    extra = {}
+    if os.name == "nt":
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=stdout,
-                            stderr=subprocess.PIPE, text=text)
+                            stderr=subprocess.PIPE, text=text, **extra)
     try:
         while True:
             check_cancel(cancel)
@@ -171,8 +175,18 @@ def run_process(cmd, *, cancel=None, stdout=subprocess.PIPE, text=False):
 # 二进制定位
 # --------------------------------------------------------------------------- #
 
+def _binary_names(name: str):
+    """候选文件名（Windows 下 PyInstaller 打进的是 ``name.exe``）。"""
+    if os.name == "nt":
+        return (name, name + ".exe")
+    return (name,)
+
+
 def _locate_binary(name: str):
-    """依次在 PATH、PyInstaller 打包目录、macOS .app 资源目录中查找可执行文件。"""
+    """依次在 PATH、PyInstaller 打包目录中查找 ffmpeg / ffprobe。
+
+    兼容 macOS（.app/Contents 布局）与 Windows（onedir 的 _internal 目录）。
+    """
     exe = shutil.which(name)
     if exe and not getattr(sys, "frozen", False):
         return exe
@@ -181,23 +195,23 @@ def _locate_binary(name: str):
     if getattr(sys, "frozen", False):
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            bases.append(meipass)  # onedir 模式：Contents/MacOS
-
-        exe_dir = os.path.dirname(sys.executable)  # Contents/MacOS
+            bases.append(meipass)          # onedir：_internal（Win）/ Contents/MacOS（mac）
+        exe_dir = os.path.dirname(sys.executable)
         bases.append(exe_dir)
-
-        contents = os.path.dirname(exe_dir)  # .app/Contents
-        if contents.endswith("Contents"):
-            bases.append(os.path.join(contents, "Resources"))
-            bases.append(os.path.join(contents, "Frameworks"))
+        if sys.platform == "darwin":
+            contents = os.path.dirname(exe_dir)  # .app/Contents
+            if contents.endswith("Contents"):
+                bases.append(os.path.join(contents, "Resources"))
+                bases.append(os.path.join(contents, "Frameworks"))
 
     for base in bases:
         if not base:
             continue
         for sub in ("", "bin"):
-            cand = os.path.join(base, sub, name)
-            if os.path.isfile(cand) and os.access(cand, os.X_OK):
-                return cand
+            for fname in _binary_names(name):
+                cand = os.path.join(base, sub, fname)
+                if os.path.isfile(cand) and (os.name == "nt" or os.access(cand, os.X_OK)):
+                    return cand
     return exe
 
 
@@ -327,14 +341,76 @@ def downmix_mono(pcm):
     return pcm.mean(axis=1) if pcm.ndim > 1 else pcm
 
 
+class _MappedPCM(np.memmap):
+    """带临时文件路径的 memmap（Windows 需在释放时手动删除文件）。"""
+
+    def __new__(cls, path, **kwargs):
+        obj = super().__new__(cls, path, **kwargs)
+        obj._tmp_path = path
+        return obj
+
+
+def release_pcm(pcm) -> None:
+    """释放 PCM 映射并删除临时文件。
+
+    Windows 上 memmap 仍引用文件时无法删除，必须显式关闭映射；
+    macOS/Linux 使用匿名 TemporaryFile，关闭即自动清理（此函数为无操作）。
+    """
+    if pcm is None:
+        return
+    try:
+        mm = getattr(pcm, "_mmap", None)
+        if mm is not None:
+            mm.close()
+    except Exception:  # noqa: BLE001
+        pass
+    tmp = getattr(pcm, "_tmp_path", None)
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def decode_pcm(path, channels, cancel=None):
-    """Decode to an anonymous temporary file and map it, instead of holding bytes in RAM."""
+    """Decode to a temporary file and map it, instead of holding bytes in RAM.
+
+    macOS/Linux 使用匿名 TemporaryFile（关闭即删）；Windows 上 memmap 仍引用文件时
+    无法删除，因此改用命名临时文件，由调用方调用 ``release_pcm`` 清理。
+    """
     ffmpeg, _ = ensure_ffmpeg()
     info = probe(path, cancel=cancel)
     n_ch = channels if channels > 0 else info["channels"]
+    cmd = [ffmpeg, "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0",
+           "-vn", "-f", "f32le", "-c:a", "pcm_f32le", "-"]
+
+    if os.name == "nt":
+        fd, tmp = tempfile.mkstemp(prefix="audioanalysis-", suffix=".pcm")
+        raw = os.fdopen(fd, "wb")
+        try:
+            proc = run_process(cmd, cancel=cancel, stdout=raw)
+            if proc.returncode:
+                raise RuntimeError(proc.stderr.decode(errors="replace")[-2000:] or "解码失败")
+            size = raw.tell()
+            raw.close()
+            if not size:
+                raise RuntimeError("音频流没有可解码的样本")
+            if n_ch <= 0 or size % (4 * n_ch):
+                raise RuntimeError("解码数据与声道数不匹配")
+            return _MappedPCM(tmp, dtype="<f4", mode="r",
+                              shape=(size // (4 * n_ch), n_ch)), info["sample_rate"]
+        except BaseException:
+            try:
+                raw.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
     with tempfile.TemporaryFile() as raw:
-        cmd = [ffmpeg, "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0",
-               "-vn", "-f", "f32le", "-c:a", "pcm_f32le", "-"]
         proc = run_process(cmd, cancel=cancel, stdout=raw)
         if proc.returncode:
             raise RuntimeError(proc.stderr.decode(errors="replace")[-2000:] or "解码失败")
@@ -508,26 +584,30 @@ def analyze_file(path, cancel=None):
     except Exception as exc:
         res.error = f"响度测量失败：{exc}"
     try:
-        pcm, sr = decode_pcm(path, res.channels, cancel=cancel)
-        res.total_samples = int(pcm.size)
-        res.sample_peak_dbfs = sample_peak(pcm, cancel)
-        count, total, ranges = detect_clipping(pcm, sr, cancel=cancel)
-        res.clipped_samples, res.clip_ranges = count, ranges
-        res.clip_percent, res.clipped = count / total, bool(ranges)
-        res.centroid_magnitude_hz, res.centroid_power_hz = spectral_centroids(pcm, sr, cancel=cancel)
+        pcm = None
         try:
-            res.bpm = estimate_bpm(pcm, sr, cancel=cancel)
-            if res.bpm is None:
-                res.warnings.append("节拍证据不足或音频过短，未提供 BPM")
-        except AnalysisCancelled:
-            raise
-        except Exception as exc:
-            res.warnings.append(f"BPM 测量不可用：{exc}")
-        if res.duration < 30:
-            res.warnings.append("音频短于 30 秒，LRA/BPM 仅供参考")
-        if res.sample_peak_dbfs is None:
-            res.integrated_lufs = res.loudness_range_lu = res.true_peak_dbtp = None
-            res.warnings.append("纯静音：响度、峰值与频谱指标不适用")
+            pcm, sr = decode_pcm(path, res.channels, cancel=cancel)
+            res.total_samples = int(pcm.size)
+            res.sample_peak_dbfs = sample_peak(pcm, cancel)
+            count, total, ranges = detect_clipping(pcm, sr, cancel=cancel)
+            res.clipped_samples, res.clip_ranges = count, ranges
+            res.clip_percent, res.clipped = count / total, bool(ranges)
+            res.centroid_magnitude_hz, res.centroid_power_hz = spectral_centroids(pcm, sr, cancel=cancel)
+            try:
+                res.bpm = estimate_bpm(pcm, sr, cancel=cancel)
+                if res.bpm is None:
+                    res.warnings.append("节拍证据不足或音频过短，未提供 BPM")
+            except AnalysisCancelled:
+                raise
+            except Exception as exc:
+                res.warnings.append(f"BPM 测量不可用：{exc}")
+            if res.duration < 30:
+                res.warnings.append("音频短于 30 秒，LRA/BPM 仅供参考")
+            if res.sample_peak_dbfs is None:
+                res.integrated_lufs = res.loudness_range_lu = res.true_peak_dbtp = None
+                res.warnings.append("纯静音：响度、峰值与频谱指标不适用")
+        finally:
+            release_pcm(pcm)   # Windows：关闭映射并删除临时文件（其他平台自动清理）
     except AnalysisCancelled:
         raise
     except Exception as exc:

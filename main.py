@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-音频分析 — macOS 桌面 GUI。
+音频分析 — macOS / Windows 桌面 GUI。
 
 特性：
   · 拖入音频文件/文件夹，后台自动分析，无需实时播放
@@ -50,12 +50,38 @@ from analyzer import (
 )
 
 
+# --------------------------------------------------------------------------- #
+# 平台相关（macOS / Windows）
+# --------------------------------------------------------------------------- #
+
+IS_MAC = sys.platform == "darwin"
+IS_WIN = sys.platform == "win32"
+
+
+def _app_data_dir() -> str:
+    """用户数据目录（曲库、分析结果）。"""
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "AudioBatchAnalyzer")
+    return os.path.join(os.path.expanduser("~"), "Library",
+                        "Application Support", "AudioBatchAnalyzer")
+
+
+def _log_dir() -> str:
+    """诊断日志目录。"""
+    if IS_WIN:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "AudioAnalysis", "Logs")
+    return os.path.join(os.path.expanduser("~"), "Library", "Logs")
+
+
 def _log(msg: str):
     """写诊断日志（append + 立即落盘，崩溃时也能保留最后执行到哪一步）。"""
     try:
         import time
-        path = os.path.join(os.path.expanduser("~"), "Library", "Logs",
-                            "AudioAnalysis.log")
+        folder = _log_dir()
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "AudioAnalysis.log")
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
     except Exception:
@@ -150,8 +176,8 @@ _T = {
     "label_language": ("语言：", "Language:"),
     "lang_zh": ("中文", "中文"),
     "lang_en": ("English", "English"),
-    "theme_hint": ("「跟随系统」会在系统切换深浅色时自动跟随（macOS 控制中心）。",
-                    "Follow System auto-tracks macOS light/dark mode."),
+    "theme_hint": ("「跟随系统」会在系统切换深浅色时自动跟随。",
+                    "Follow System auto-tracks the OS light/dark mode."),
     "group_analysis": ("分析", "Analysis"),
     "label_target_lufs": ("目标 LUFS 参考值：", "Target LUFS:"),
     "label_tp_warn": ("真峰值警告阈值：", "True Peak Warning Threshold:"),
@@ -653,7 +679,22 @@ def _dark_palette() -> QPalette:
 
 
 def detect_system_dark() -> bool:
-    """通过读取系统 plist 检测深浅色（纯 Python，不用 subprocess / Qt 接口）。"""
+    """检测系统深浅色（纯 Python，不依赖 Qt 接口）。"""
+    if IS_WIN:
+        # Windows：注册表 AppsUseLightTheme（0 = 深色，1 = 浅色）
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            try:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            finally:
+                winreg.CloseKey(key)
+            return value == 0
+        except Exception as e:  # noqa: BLE001
+            _log(f"detect_system_dark(win): 异常 {e!r}")
+            return False
     try:
         import plistlib
         path = os.path.expanduser("~/Library/Preferences/.GlobalPreferences.plist")
@@ -1649,8 +1690,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _default_data_dir() -> str:
-        return os.path.join(os.path.expanduser("~"), "Library",
-                            "Application Support", "AudioBatchAnalyzer")
+        return _app_data_dir()
 
     def _library_file(self) -> str:
         return os.path.join(self._data_dir, "library.json")
@@ -1713,18 +1753,16 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------- 关闭窗口 vs 退出
     def closeEvent(self, event):
-        """点左上角红叉时只隐藏窗口（保留记录与 Dock 图标），不退出。
-
-        只有通过 Dock 右键「退出」或 Cmd+Q 才会真正退出。
-        """
-        if self._really_quit:
+        """macOS：点红叉只隐藏窗口（保留记录与 Dock 图标），不退出；
+        Windows：关闭窗口即正常退出（符合平台习惯）。"""
+        if self._really_quit or IS_WIN:
             _log("closeEvent: 真正退出")
             event.accept()
-        else:
-            _log("closeEvent: 隐藏窗口（保留记录，Dock 图标仍在）")
-            self._stop_playback()
-            event.ignore()
-            self.hide()
+            return
+        _log("closeEvent: 隐藏窗口（保留记录，Dock 图标仍在）")
+        self._stop_playback()
+        event.ignore()
+        self.hide()
 
     def shutdown(self):
         """All quit paths cancel and join workers before Qt destroys their parents."""
@@ -2326,11 +2364,12 @@ def _install_excepthook():
     """把未捕获异常写入日志文件（--windowed 模式下无控制台，便于排查）。"""
     import time
     import traceback
-    log_path = os.path.join(
-        os.path.expanduser("~"), "Library", "Logs", "AudioAnalysis.log")
+    log_path = os.path.join(_log_dir(), "AudioAnalysis.log")
+
 
     def hook(exc_type, exc_value, exc_tb):
         try:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write("=" * 60 + "\n")
                 f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 未捕获异常\n")
@@ -2382,12 +2421,14 @@ def main():
     win = MainWindow(config)
     _log("main: MainWindow 已创建")
 
-    # 关闭最后一个窗口时不退出（点红叉只隐藏窗口，Dock 图标保留）
-    app.setQuitOnLastWindowClosed(False)
-
-    # 点击 Dock 图标重新打开窗口
-    dock_filter = DockReopenFilter(win)
-    app.installEventFilter(dock_filter)
+    # macOS：关闭最后一个窗口不退出（红叉只隐藏窗口），点 Dock 图标重新打开
+    # Windows：关闭窗口即退出程序（平台习惯）
+    if IS_MAC:
+        app.setQuitOnLastWindowClosed(False)
+        dock_filter = DockReopenFilter(win)
+        app.installEventFilter(dock_filter)
+    else:
+        app.setQuitOnLastWindowClosed(True)
 
     # 空格键控制播放 / 暂停（应用级事件过滤器）
     app.installEventFilter(win)

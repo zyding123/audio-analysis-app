@@ -1,14 +1,25 @@
 # 音频分析 Audio Analysis
 
-面向 AI 音频、AI 音乐与音视频评测标注的 macOS 桌面工具。离线批量测量响度、峰值、频谱、疑似满幅削波和 BPM，支持曲库、试听、图表以及 CSV / JSON 导出。
+面向 AI 音频、AI 音乐与音视频评测标注的 **macOS / Windows** 桌面工具。离线批量测量响度、峰值、频谱、疑似满幅削波和 BPM，支持曲库、试听、图表以及 CSV / JSON 导出。
 
 ## 下载与安装
 
-在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.1.0 Apple Silicon DMG**，打开后将“音频分析”拖入 Applications。应用仅做本地处理，不上传音频。安装包为临时签名，尚未使用 Apple 开发者证书公证；系统首次打开时可能需要在“系统设置 → 隐私与安全性”中允许。
+在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.2.0**：
+
+- **Windows x64**：`audio-analysis-v1.2.0-windows-x64-setup.exe`，双击安装（中英文向导），自带 ffmpeg、开始菜单/桌面快捷方式与卸载程序。安装包未签名，首次运行如遇 SmartScreen 提示请选择「更多信息 → 仍要运行」。
+- **macOS（Apple Silicon）**：`audio-analysis-v1.2.0-macos-arm64.dmg`，打开后将“音频分析”拖入 Applications；临时签名，首次打开可能需要在「系统设置 → 隐私与安全性」中允许。
+
+应用仅做本地处理，不上传音频。
 
 ![主界面](screenshots/main.png)
 
-## v1.1.0 更新
+## v1.2.0 更新
+
+- **新增 Windows x64 版本**：同一套测量引擎与界面，功能对齐 macOS 版，可直接安装。
+- Windows 平台适配：`%APPDATA%` 数据目录、`%LOCALAPPDATA%` 日志、注册表主题跟随、关闭即退出；ffmpeg 子进程隐藏控制台窗口，临时解码文件自动清理。
+- 双平台 CI：GitHub Actions 在 macOS 与 Windows 上分别跑回归测试、打包与包内自检，统一发布到 Release（附带 SHA-256 校验文件）。
+
+### v1.1.0 的主要修复（沿用）
 
 - 分别计算各声道的频谱与节拍证据，避免直接相加/相减丢掉反相素材或中置声部。
 - 满幅平台检查结合连续性、极性与平坦程度，修复低频干净正弦的误报；结果明确标为“疑似”，不把检测结果当作可听失真的证明。
@@ -49,7 +60,9 @@
 
 ## 源码运行和验证
 
-Python 3.13，使用独立虚拟环境：
+Python 3.13，使用独立虚拟环境。
+
+**macOS / Linux**
 
 ```bash
 python3 -m venv .venv
@@ -61,9 +74,24 @@ QT_QPA_PLATFORM=offscreen python main.py --self-test
 bash build_macos.sh
 ```
 
-`static-ffmpeg` 在首次源码运行时可能下载 FFmpeg。发布的 App 已内置 FFmpeg / ffprobe，用户无需安装 Python 或运行环境。
+**Windows（PowerShell）**
 
-构建输出位于 `dist/v1.1.0/`：App、DMG、SHA-256 校验文件。DMG 同时包含 Applications 快捷方式。GitHub Actions 在推送代码时检查测试和打包，主分支通过检查后按 `version.py` 创建对应的 Release 和标签；同版本已发布文件不会被覆盖。
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-build.txt
+python main.py
+python -m unittest discover -s tests -v
+$env:QT_QPA_PLATFORM="offscreen"; python main.py --self-test
+powershell -ExecutionPolicy Bypass -File build_windows.ps1
+```
+
+> Windows 打包需要安装 [Inno Setup 6](https://jrsoftware.org/isdl.php)（`ISCC.exe`）。
+
+`static-ffmpeg` 在首次源码运行时可能下载 FFmpeg。发布的安装包已内置 FFmpeg / ffprobe，用户无需安装 Python 或运行环境。
+
+构建输出位于 `dist/v1.2.0/`（macOS：App / DMG / SHA-256；Windows：应用目录 / setup.exe / SHA-256）。
+GitHub Actions 在推送代码时并行检查两个平台；主分支通过检查后按 `version.py` 创建或更新对应 Release。
 
 ## 项目文件
 
@@ -71,6 +99,7 @@ bash build_macos.sh
 - `main.py`：Qt 界面、任务生命周期、曲库、试听和导出
 - `charts.py`：多声道频谱与图表生成
 - `version.py`：版本号与构建号
+- `build_macos.sh` / `build_windows.ps1` / `installer.iss` / `version_info.txt`：双平台构建与安装包
 - `tests/`：自动回归检查
 - `smoke_test.py`：独立数据目录下的源码/打包自检
 - `build_macos.sh`：构建、签名验证、自检、生成安装包

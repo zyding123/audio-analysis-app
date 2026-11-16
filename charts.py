@@ -9,13 +9,15 @@ matplotlib.use('Agg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
-from analyzer import AnalysisCancelled, check_cancel, decode_pcm, probe
+from analyzer import AnalysisCancelled, check_cancel, decode_pcm, probe, release_pcm
 
 BG, GRID, TXT, SUB, BLUE, DIM = '#0f1115', '#2a2f3a', '#e6e9ef', '#9aa3b2', '#5d9cec', '#8892a6'
 DPI = 150
 SPEC_FIGSIZE, CURVE_FIGSIZE = (11, 3.4), (11, 3.6)
 _RENDER_LOCK = threading.Lock()
-matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Hiragino Sans GB', 'Arial Unicode MS', 'DejaVu Sans']
+matplotlib.rcParams['font.sans-serif'] = ['PingFang SC', 'Hiragino Sans GB',
+                                          'Microsoft YaHei', 'SimHei',
+                                          'Arial Unicode MS', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 
@@ -153,4 +155,5 @@ def generate_charts(audio_path, out_dir, display_name, on_chart=None, lang='zh',
         raise
     finally:
         _RENDER_LOCK.release()
+        release_pcm(pcm)   # Windows：关闭映射并删除临时解码文件
     return paths

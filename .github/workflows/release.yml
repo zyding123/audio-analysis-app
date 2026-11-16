@@ -1,4 +1,4 @@
-name: Test, build and release macOS
+name: Test, build and release (macOS + Windows)
 on:
   push:
     branches: [main, 'codex/**']
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  macos:
     runs-on: macos-15
     timeout-minutes: 30
     env:
@@ -52,9 +52,53 @@ jobs:
           name: macos-arm64-installer
           path: dist/**/*.dmg*
 
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Configure temporary caches
+        shell: pwsh
+        run: |
+          "MPLCONFIGDIR=$env:RUNNER_TEMP\matplotlib" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "NUMBA_CACHE_DIR=$env:RUNNER_TEMP\numba" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install tested dependencies
+        run: python -m pip install -r requirements-build.txt
+      - name: Locate bundled ffmpeg for tests
+        shell: pwsh
+        run: |
+          $dir = python -c @"
+          import contextlib, io, os, shutil
+          import static_ffmpeg
+          with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+              static_ffmpeg.add_paths()
+          print(os.path.dirname(shutil.which('ffmpeg')))
+          "@
+          $dir.Trim() | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          Write-Host "ffmpeg dir: $dir"
+      - name: Run regression checks
+        run: python -m unittest discover -s tests -v
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+      - name: Build, self-test and package installer
+        shell: pwsh
+        run: |
+          $env:PY = "python"
+          powershell -ExecutionPolicy Bypass -File build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-installer
+          path: dist/**/*setup.exe*
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
-    needs: verify
+    needs: [macos, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,8 +107,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: macos-arm64-installer
-          path: release-assets
-      - name: Publish verified installer
+          path: release-assets/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-installer
+          path: release-assets/windows
+      - name: Publish verified installers
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -73,12 +121,18 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             test "${GITHUB_REF_NAME}" = "${tag}"
           fi
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            echo "Release ${tag} already exists; preserving the published files."
-            exit 0
+          mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.sha256' \) | sort)
+          if [ "${#assets[@]}" -lt 2 ]; then
+            echo "No installers produced; aborting." >&2
+            exit 1
           fi
-          mapfile -t assets < <(find release-assets -type f \( -name '*.dmg' -o -name '*.sha256' \))
-          test "${#assets[@]}" -eq 2
-          gh release create "${tag}" --target "${GITHUB_SHA}" --latest \
-            --title "v${version} 音频分析（macOS · Apple Silicon）" \
-            --notes-file RELEASE_NOTES.md "${assets[@]}"
+          echo "Assets to publish:"
+          printf '  %s\n' "${assets[@]}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "Release ${tag} already exists; uploading/refreshing assets."
+            gh release upload "${tag}" --clobber "${assets[@]}"
+          else
+            gh release create "${tag}" --target "${GITHUB_SHA}" --latest \
+              --title "v${version} 音频分析（macOS · Apple Silicon / Windows x64）" \
+              --notes-file RELEASE_NOTES.md "${assets[@]}"
+          fi
