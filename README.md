@@ -4,11 +4,11 @@
 
 ## 下载与安装
 
-在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.2.1**：
+在 [GitHub Releases](https://github.com/zyding123/audio-analysis-app/releases/latest) 下载 **v1.2.2**：
 
-- **macOS · Apple Silicon（M 系列）**：`audio-analysis-v1.2.1-macos-arm64.dmg`，打开后将“音频分析”拖入 Applications。
-- **macOS · Intel**：`audio-analysis-v1.2.1-macos-x86_64.dmg`，同上。
-- **Windows x64**：`audio-analysis-v1.2.1-windows-x64-setup.exe`，双击安装（中英文向导），自带 ffmpeg、开始菜单/桌面快捷方式与卸载程序。
+- **macOS · Apple Silicon（M 系列）**：`audio-analysis-v1.2.2-macos-arm64.dmg`，打开后将“音频分析”拖入 Applications。
+- **macOS · Intel**：`audio-analysis-v1.2.2-macos-x86_64.dmg`，同上。
+- **Windows x64**：`audio-analysis-v1.2.2-windows-x64-setup.exe`，双击安装（中英文向导），自带 ffmpeg、开始菜单/桌面快捷方式与卸载程序。
 
 > macOS 两个包不可互换：左上角  →「关于本机」→ 芯片一栏可确认是「Intel」还是「Apple M 系列」。
 > 安装包未做代码签名：Windows 首次运行如遇 SmartScreen 提示请选「更多信息 → 仍要运行」；
@@ -17,6 +17,13 @@
 应用仅做本地处理，不上传音频。
 
 ![主界面](screenshots/main.png)
+
+## v1.2.2 更新
+
+- **频谱图纵轴**：改为标准整数刻度（100/200/500/1K/2K/5K/10K/20K），上限提升到 **24 kHz**；
+  新增 **14K/15K/16K 三条参考横线**（橙→红），用于判断高频截止。
+- **平均频谱曲线横轴**：同样改为标准整数刻度、上限 24 kHz，并新增 **16K 参考竖线**。
+- 图表显示调整，测量结果不受影响。
 
 ## v1.2.1 更新
 

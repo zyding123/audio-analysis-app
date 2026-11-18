@@ -90,6 +90,62 @@ def _figure(size):
     return fig, ax
 
 
+# --------------------------------------------------------------------------- #
+# 频率轴：标准整数刻度（1K / 10K 风格）+ 24 kHz 上限 + 高频参考线
+# --------------------------------------------------------------------------- #
+
+FREQ_MAX = 24000                      # 纵/横轴上限：覆盖 48 kHz 采样率音频的完整频带
+FREQ_TICKS = [100, 200, 500, 1000, 2000, 5000, 10000, 20000]
+FREQ_LABELS = ['100', '200', '500', '1K', '2K', '5K', '10K', '20K']
+# 判断高频截断用的参考线：(频率 Hz, 颜色, 标注垂直偏移/点)
+SPEC_CUTOFF_LINES = ((14000, '#ffb74d', 7), (15000, '#ff9800', -11), (16000, '#ff6b6b', 8))
+
+
+def _label(v):
+    return f'{v / 1000:.0f}K' if v >= 1000 else f'{v:.0f}'
+
+
+def _style_frequency_axis(ax, which, *, cutoff_lines=()):
+    """把对数频率轴换成标准整数刻度，并（可选）加高频参考线。
+
+    which='y'：频谱图纵轴；which='x'：平均频谱曲线横轴。
+    cutoff_lines：(频率 Hz, 颜色, 标注偏移点) —— 偏移用于错开相邻标注，避免重叠。
+    """
+    import matplotlib.ticker as mticker
+    axis = ax.yaxis if which == 'y' else ax.xaxis
+    if which == 'y':
+        ax.set_ylim(20, FREQ_MAX)
+        ax.set_yticks(FREQ_TICKS)
+        ax.set_yticklabels(FREQ_LABELS)
+        axis.set_minor_locator(mticker.NullLocator())
+    else:
+        ax.set_xlim(20, FREQ_MAX)
+        ax.set_xticks(FREQ_TICKS)
+        ax.set_xticklabels(FREQ_LABELS)
+        axis.set_minor_locator(mticker.NullLocator())
+
+    if not cutoff_lines:
+        return
+    lo, hi = (ax.get_ylim() if which == 'y' else ax.get_xlim())
+    for entry in cutoff_lines:
+        freq, color = entry[0], entry[1]
+        dy = entry[2] if len(entry) > 2 else 0
+        if freq <= 0 or not (lo <= freq <= hi):
+            continue
+        if which == 'y':
+            ax.axhline(freq, color=color, lw=0.9, ls='--', alpha=0.9)
+            ax.annotate(_label(freq), xy=(1.004, freq), xycoords=ax.get_yaxis_transform(),
+                        xytext=(0, dy), textcoords='offset points',
+                        color=color, fontsize=7, va='center', ha='left',
+                        annotation_clip=False)
+        else:
+            ax.axvline(freq, color=color, lw=1.0, ls='--', alpha=0.9)
+            ax.annotate(_label(freq), xy=(freq, 1.001), xycoords=ax.get_xaxis_transform(),
+                        xytext=(0, dy), textcoords='offset points',
+                        color=color, fontsize=8, va='bottom', ha='left',
+                        annotation_clip=False)
+
+
 def render_spectrogram(pcm, sr, out_png, title, *, lang='zh', cancel=None):
     import librosa.display
     db, hop, n_fft = spectrogram_db(pcm, sr, cancel)
@@ -100,6 +156,8 @@ def render_spectrogram(pcm, sr, out_png, title, *, lang='zh', cancel=None):
     ax.set_xlabel('时间 (s)' if lang == 'zh' else 'Time (s)', color=SUB, fontsize=9)
     ax.set_ylabel('频率 (Hz)' if lang == 'zh' else 'Frequency (Hz)', color=SUB, fontsize=9)
     ax.set_title(title, color=TXT, fontsize=11)
+    # 标准整数刻度 + 24 kHz 上限 + 14/15/16 kHz 高频截断参考线
+    _style_frequency_axis(ax, 'y', cutoff_lines=SPEC_CUTOFF_LINES)
     cb = fig.colorbar(img, ax=ax, format='%+2.0f dB')
     cb.ax.tick_params(colors=SUB, labelsize=8)
     cb.outline.set_edgecolor(GRID)
@@ -114,12 +172,13 @@ def render_spectrum_curve(pcm, sr, out_png, title, curve_label, *, lang='zh', ca
     f, p = average_psd(pcm, sr, cancel)
     fig, ax = _figure(CURVE_FIGSIZE)
     ax.semilogx(f[1:], 10 * np.log10(p[1:] + 1e-20), color=BLUE, lw=1.3, label=curve_label)
-    ax.set_xlim(20, max(21, min(20000, sr / 2)))
+    # 标准整数刻度 + 24 kHz 上限 + 16 kHz 截断参考线（判断高频截止）
+    _style_frequency_axis(ax, 'x', cutoff_lines=((16000, '#ff6b6b'),))
     ax.set_xlabel('频率 (Hz, 对数)' if lang == 'zh' else 'Frequency (Hz, log)', color=SUB, fontsize=9)
     ax.set_ylabel('功率谱密度 (dB/Hz)' if lang == 'zh' else 'Power spectral density (dB/Hz)', color=SUB, fontsize=9)
     ax.set_title(title, color=TXT, fontsize=11)
     ax.grid(color=GRID, lw=0.4, alpha=0.5)
-    ax.legend(loc='upper right', fontsize=9, framealpha=0.15)
+    ax.legend(loc='upper left', fontsize=9, framealpha=0.15)   # 左上：避开 16K 标注
     fig.tight_layout()
     check_cancel(cancel)
     fig.savefig(out_png, facecolor=BG)
